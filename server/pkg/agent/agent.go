@@ -140,6 +140,13 @@ type Session struct {
 	Messages <-chan Message
 	// Result receives exactly one value — the final outcome — then closes.
 	Result <-chan Result
+	// turnControl is supplied by backends that can act on a turn while it is
+	// still running — see turn_control.go for the provider-neutral contract
+	// and codex.go for the reference implementation. nil means this provider
+	// has no such capability, which every turn-control entry point reports as
+	// ErrTurnControlUnsupported rather than panicking, so a caller can hold any
+	// Session without knowing which backend produced it.
+	turnControl func(context.Context, TurnControlRequest) (TurnControlResult, error)
 }
 
 // MessageType identifies the kind of Message.

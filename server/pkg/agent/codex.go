@@ -839,6 +839,19 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	}
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
+	// Keep the public control handle aligned with the live retry attempt.
+	// The write lock makes a retry transition fail closed rather than writing
+	// to the discarded process.
+	var activeControlMu sync.RWMutex
+	activeControl := firstSession.control
+	control := func(controlCtx context.Context, request ControlRequest) (ControlResult, error) {
+		activeControlMu.RLock()
+		defer activeControlMu.RUnlock()
+		if activeControl == nil {
+			return ControlResult{}, ErrControlInactive
+		}
+		return activeControl(controlCtx, request)
+	}
 
 	go func() {
 		defer close(msgCh)
@@ -847,12 +860,18 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		attemptOpts := opts
 		for attempt := 1; attempt <= 2; attempt++ {
 			if attempt > 1 {
+				activeControlMu.Lock()
+				activeControl = nil
+				activeControlMu.Unlock()
 				var err error
 				session, err = b.executeOnce(ctx, prompt, attemptOpts, attempt)
 				if err != nil {
 					resCh <- Result{Status: "failed", Error: err.Error()}
 					return
 				}
+				activeControlMu.Lock()
+				activeControl = session.control
+				activeControlMu.Unlock()
 			}
 			// Hold back the leading session-pin status messages until this
 			// attempt proves it made real progress. A retry never continues the
@@ -930,7 +949,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh, control: firstSession.control}, nil
+	return &Session{Messages: msgCh, Result: resCh, control: control}, nil
 }
 
 func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts ExecOptions, attempt int) (*Session, error) {
@@ -1112,8 +1131,8 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		cfg:                  b.cfg,
 		stdin:                stdin,
 		pending:              make(map[int]*pendingRPC),
-		controlResults:       make(map[string]ControlResult),
-		completedEvents:      make(chan codexCompletedEvent, 16),
+		controlRequests:      make(map[string]*codexControlRequest),
+		completionWaiters:    make(map[string]map[chan codexCompletedEvent]struct{}),
 		processDone:          make(chan struct{}),
 		handshakeTimeout:     handshakeTimeout,
 		pid:                  cmd.Process.Pid,
@@ -2143,14 +2162,22 @@ type codexCompletedEvent struct {
 	status   string
 }
 
+type codexControlRequest struct {
+	fingerprint string
+	done        chan struct{}
+	result      ControlResult
+	err         error
+}
+
 type codexClient struct {
 	cfg                Config
 	stdin              interface{ Write([]byte) (int, error) }
 	mu                 sync.Mutex
-	writeMu            sync.Mutex // serializes JSON-RPC stdin frames
-	controlMu          sync.Mutex // serializes/idempotently caches cooperative controls
-	controlResults     map[string]ControlResult
-	completedEvents    chan codexCompletedEvent
+	writeMu            sync.Mutex // serializes every JSON-RPC stdin frame
+	controlMu          sync.Mutex // protects stable control request ownership/results
+	controlRequests    map[string]*codexControlRequest
+	completionMu       sync.Mutex // protects non-lossy completion waiters
+	completionWaiters  map[string]map[chan codexCompletedEvent]struct{}
 	nextID             int
 	pending            map[int]*pendingRPC
 	processDone        chan struct{}
@@ -2357,9 +2384,7 @@ func (c *codexClient) request(ctx context.Context, method string, params any) (j
 		return nil, err
 	}
 	data = append(data, '\n')
-	c.writeMu.Lock()
-	_, writeErr := c.stdin.Write(data)
-	c.writeMu.Unlock()
+	_, writeErr := c.writeFrame(data)
 	if writeErr != nil {
 		err := writeErr
 		c.mu.Lock()
@@ -2403,83 +2428,145 @@ func (c *codexClient) request(ctx context.Context, method string, params any) (j
 	}
 }
 
+// writeFrame is the sole writer to Codex stdin. JSON-RPC requests, notifications,
+// approval responses, and protocol errors all share this lock so frames cannot interleave.
+func (c *codexClient) writeFrame(data []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.stdin.Write(data)
+}
+
 func (c *codexClient) notify(method string) {
-	msg := map[string]any{
-		"jsonrpc": "2.0",
-		"method":  method,
-	}
-	data, _ := json.Marshal(msg)
-	data = append(data, '\n')
-	_, _ = c.stdin.Write(data)
+	data, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": method})
+	_, _ = c.writeFrame(append(data, '\n'))
 }
 
 func (c *codexClient) respond(id int, result any) {
-	msg := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"result":  result,
-	}
-	data, _ := json.Marshal(msg)
-	data = append(data, '\n')
-	_, _ = c.stdin.Write(data)
+	data, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+	_, _ = c.writeFrame(append(data, '\n'))
 }
 
 func (c *codexClient) respondError(id int, code int, message string) {
-	msg := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"error": map[string]any{
-			"code":    code,
-			"message": message,
-		},
-	}
-	data, _ := json.Marshal(msg)
-	data = append(data, '\n')
-	_, _ = c.stdin.Write(data)
+	data, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": code, "message": message}})
+	_, _ = c.writeFrame(append(data, '\n'))
 }
 
-// control sends one provider-native cooperative control and only accepts it after
-// the app-server confirms the correlated turn/completed boundary.
-func (c *codexClient) control(ctx context.Context, request ControlRequest) (ControlResult, error) {
-	c.controlMu.Lock()
-	defer c.controlMu.Unlock()
-	if result, ok := c.controlResults[request.RequestID]; ok {
-		return result, nil
+func controlFingerprint(r ControlRequest) string {
+	return string(r.Operation) + "\x00" + r.Instruction + "\x00" + r.ExpectedProviderSessionID + "\x00" + r.ExpectedProviderTurnID
+}
+
+func completionKey(threadID, turnID string) string { return threadID + "\x00" + turnID }
+
+// registerCompletion is deliberately done before the provider write. Unlike the
+// old bounded event channel, every registered waiter receives its matching event.
+func (c *codexClient) registerCompletion(threadID, turnID string) chan codexCompletedEvent {
+	ch := make(chan codexCompletedEvent, 1)
+	key := completionKey(threadID, turnID)
+	c.completionMu.Lock()
+	if c.completionWaiters == nil {
+		c.completionWaiters = make(map[string]map[chan codexCompletedEvent]struct{})
 	}
+	if c.completionWaiters[key] == nil {
+		c.completionWaiters[key] = make(map[chan codexCompletedEvent]struct{})
+	}
+	c.completionWaiters[key][ch] = struct{}{}
+	c.completionMu.Unlock()
+	return ch
+}
+
+func (c *codexClient) unregisterCompletion(threadID, turnID string, ch chan codexCompletedEvent) {
+	key := completionKey(threadID, turnID)
+	c.completionMu.Lock()
+	if waiters := c.completionWaiters[key]; waiters != nil {
+		delete(waiters, ch)
+		if len(waiters) == 0 {
+			delete(c.completionWaiters, key)
+		}
+	}
+	c.completionMu.Unlock()
+}
+
+func (c *codexClient) publishCompletion(event codexCompletedEvent) {
+	key := completionKey(event.threadID, event.turnID)
+	c.completionMu.Lock()
+	for ch := range c.completionWaiters[key] {
+		ch <- event
+	}
+	c.completionMu.Unlock()
+}
+
+// control gives each RequestID one owner. Duplicates observe its exact result;
+// conflicting reuse never reaches provider stdin.
+func (c *codexClient) control(ctx context.Context, request ControlRequest) (ControlResult, error) {
 	c.mu.Lock()
 	threadID, turnID, dead := c.threadID, c.turnID, c.processErr
 	c.mu.Unlock()
-	if dead != nil || threadID == "" || turnID == "" {
+	if dead != nil || threadID == "" || turnID == "" || request.ExpectedProviderSessionID == "" || request.ExpectedProviderTurnID == "" || request.ExpectedProviderSessionID != threadID || request.ExpectedProviderTurnID != turnID {
 		return ControlResult{}, ErrControlInactive
 	}
-	if request.ExpectedProviderSessionID != "" && request.ExpectedProviderSessionID != threadID {
-		return ControlResult{}, ErrControlInactive
+
+	fingerprint := controlFingerprint(request)
+	c.controlMu.Lock()
+	if existing := c.controlRequests[request.RequestID]; existing != nil {
+		if existing.fingerprint != fingerprint {
+			c.controlMu.Unlock()
+			return ControlResult{}, ErrControlRequestConflict
+		}
+		c.controlMu.Unlock()
+		select {
+		case <-existing.done:
+			return existing.result, existing.err
+		case <-ctx.Done():
+			return ControlResult{}, ctx.Err()
+		}
 	}
-	if request.ExpectedProviderTurnID != "" && request.ExpectedProviderTurnID != turnID {
-		return ControlResult{}, ErrControlInactive
+	owned := &codexControlRequest{fingerprint: fingerprint, done: make(chan struct{})}
+	if c.controlRequests == nil {
+		c.controlRequests = make(map[string]*codexControlRequest)
 	}
+	c.controlRequests[request.RequestID] = owned
+	c.controlMu.Unlock()
+	result, err := c.performControl(ctx, request, threadID, turnID)
+	owned.result, owned.err = result, err
+	close(owned.done)
+	return result, err
+}
+
+func (c *codexClient) performControl(ctx context.Context, request ControlRequest, threadID, turnID string) (ControlResult, error) {
+	waiter := c.registerCompletion(threadID, turnID)
+	defer c.unregisterCompletion(threadID, turnID, waiter)
 	method, params := "turn/interrupt", map[string]any{"threadId": threadID, "turnId": turnID}
 	if request.Operation == ControlCheckpoint || request.Operation == ControlCancelAndRedirect {
 		method = "turn/steer"
-		params["input"] = request.Instruction
+		params = map[string]any{"threadId": threadID, "expectedTurnId": turnID, "input": []map[string]any{{"type": "text", "text": request.Instruction}}, "clientUserMessageId": request.RequestID}
 	}
-	if _, err := c.request(ctx, method, params); err != nil {
+	raw, err := c.request(ctx, method, params)
+	if err != nil {
 		return ControlResult{}, err
 	}
-	for {
-		select {
-		case event := <-c.completedEvents:
-			if event.threadID != threadID || event.turnID != turnID {
-				continue
-			}
-			result := ControlResult{Provider: "codex", ProviderSessionID: threadID, ProviderTurnID: turnID, Accepted: true, BoundaryKind: "turn/completed", TerminalEvidence: "turn/completed:" + event.status, ResumableEvidence: "codex thread remains addressable", Timestamp: time.Now().UTC()}
-			c.controlResults[request.RequestID] = result
-			return result, nil
-		case <-ctx.Done():
-			return ControlResult{}, ctx.Err()
-		case <-c.processDone:
-			return ControlResult{}, errCodexProcessExited
+	if method == "turn/interrupt" {
+		var empty map[string]any
+		if err := json.Unmarshal(raw, &empty); err != nil || len(empty) != 0 {
+			return ControlResult{}, fmt.Errorf("invalid turn/interrupt response")
 		}
+	} else {
+		var response struct {
+			TurnID string `json:"turnId"`
+		}
+		if err := json.Unmarshal(raw, &response); err != nil || response.TurnID != turnID {
+			return ControlResult{}, fmt.Errorf("turn/steer accepted unexpected turn")
+		}
+	}
+	select {
+	case event := <-waiter:
+		if method == "turn/interrupt" && event.status != "interrupted" && event.status != "cancelled" && event.status != "canceled" {
+			return ControlResult{}, fmt.Errorf("interrupt completed with status %q", event.status)
+		}
+		return ControlResult{Provider: "codex", ProviderSessionID: threadID, ProviderTurnID: turnID, Accepted: true, BoundaryKind: "turn/completed", TerminalEvidence: "turn/completed:" + event.status, ResumableEvidence: "codex thread remains addressable", Timestamp: time.Now().UTC()}, nil
+	case <-ctx.Done():
+		return ControlResult{}, ctx.Err()
+	case <-c.processDone:
+		return ControlResult{}, errCodexProcessExited
 	}
 }
 
@@ -3184,10 +3271,7 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 		turnID := extractNestedString(params, "turn", "id")
 		status := extractNestedString(params, "turn", "status")
 		threadID, _ := params["threadId"].(string)
-		select {
-		case c.completedEvents <- codexCompletedEvent{threadID: threadID, turnID: turnID, status: status}:
-		default:
-		}
+		c.publishCompletion(codexCompletedEvent{threadID: threadID, turnID: turnID, status: status})
 		c.cfg.Logger.Info("codex turn/completed received", "thread_id", threadID, "turn_id", turnID, "status", status)
 		aborted := status == "cancelled" || status == "canceled" ||
 			status == "aborted" || status == "interrupted"

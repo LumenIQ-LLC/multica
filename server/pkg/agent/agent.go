@@ -1,71 +1,140 @@
+// Package agent provides a unified interface for executing prompts via
+// coding agents (Claude Code, CodeBuddy, Codex, Copilot, OpenCode, DevEco Code,
+// OpenClaw, Hermes, Pi, Oh-My-Pi, Cursor, Kimi, Reasonix, Kiro, Antigravity, Qoder,
+// Trae, Grok, Qwen Code, QwenPaw, MiniMax Code). It
+// mirrors the happy-cli AgentBackend pattern, translated to idiomatic Go.
 package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log"
-	"os"
-	"path/filepath"
-	"regexp"
-	"strconv"
+	"log/slog"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/multica-ai/multica/server/pkg/agent/agenterr"
-	"github.com/multica-ai/multica/server/pkg/agent/agentfailure"
-	"github.com/multica-ai/multica/server/pkg/i18n"
-	"github.com/multica-ai/multica/server/pkg/masking"
-	"github.com/multica-ai/multica/server/pkg/security"
-	"github.com/multica-ai/multica/server/pkg/types"
 )
 
-// Status represents the terminal status of an agent execution.
-type Status string
-
-const (
-	StatusCompleted Status = "completed"
-	StatusFailed    Status = "failed"
-	StatusTimedOut  Status = "timed_out"
-	StatusAborted   Status = "aborted"
-)
-
-// Message represents a streaming message from the agent.
-type Message struct {
-	Type      string         `json:"type"` // system, assistant, user, result
-	Subtype   string         `json:"subtype,omitempty"`
-	Content   string         `json:"content,omitempty"`
-	ToolName  string         `json:"toolName,omitempty"`
-	ToolID    string         `json:"toolId,omitempty"`
-	Input     map[string]any `json:"input,omitempty"`
-	Output    string         `json:"output,omitempty"`
-	IsError   bool           `json:"isError,omitempty"`
-	Raw       string         `json:"raw,omitempty"`
-	Timestamp time.Time      `json:"timestamp"`
+// Backend is the unified interface for executing prompts via coding agents.
+type Backend interface {
+	// Execute runs a prompt and returns a Session for streaming results.
+	// The caller should read from Session.Messages (optional) and wait on
+	// Session.Result for the final outcome.
+	Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error)
 }
 
-// Result represents the final execution result.
-type Result struct {
-	Status    Status `json:"status"`
-	Error     string `json:"error,omitempty"`
-	SessionID string `json:"sessionId,omitempty"`
-
-	// Usage aggregates token counts reported by the CLI. Keys include
-	// "input_tokens", "output_tokens", "cache_read_input_tokens", etc.
-	Usage map[string]int64 `json:"usage,omitempty"`
-
-	// CostUSDTicks stores the CLI-reported USD cost in 1e-10 dollar ticks.
-	// This intentionally avoids float64 at the agent↔service boundary.
-	CostUSDTicks int64 `json:"costUsdTicks,omitempty"`
-
-	// ResumeRejected is set when a resume was requested but the CLI rejected
-	// the session ID (expired, deleted, or invalid). The caller should start a
-	// fresh session instead of silently continuing without context.
-	ResumeRejected bool `json:"resumeRejected,omitempty"`
+// ExecOptions configures a single execution.
+type ExecOptions struct {
+	Cwd   string
+	Model string
+	// SystemPrompt carries the Multica runtime brief for the few providers
+	// that cannot pick it up from disk. The daemon leaves it empty for every
+	// other provider (see daemon.providerNeedsInlineSystemPrompt), because the
+	// brief is already delivered as a per-task context file in the workdir —
+	// CLAUDE.md, AGENTS.md, CODEBUDDY.md or QWEN.md depending on the runtime.
+	//
+	// A backend must therefore NOT assume this is populated, and adding a new
+	// backend that only reads SystemPrompt will silently receive nothing.
+	SystemPrompt              string
+	ThreadName                string
+	MaxTurns                  int
+	Timeout                   time.Duration
+	SemanticInactivityTimeout time.Duration
+	// FirstTurnNoProgressTimeout optionally overrides the Codex first-turn
+	// no-progress ceiling — the window a turn may stay completely silent after
+	// the app-server reports turn/started before the watchdog fails it. Zero
+	// keeps the provider default and the existing behaviour where
+	// SemanticInactivityTimeout can only shrink that ceiling; a positive value
+	// sets it explicitly, upward included. This answers a different question than
+	// SemanticInactivityTimeout ("did the process ever start producing?" vs "has
+	// a running turn gone quiet?"), so the two move independently. Currently
+	// honoured by the codex backend (GH #3262).
+	FirstTurnNoProgressTimeout time.Duration
+	// IdleWatchdogTimeout optionally narrows the daemon's generic no-message
+	// watchdog for this execution. Zero keeps the daemon-wide window, and a
+	// value above that window cannot extend the global safety bound. The
+	// daemon-wide zero still disables the watchdog entirely, and an in-flight
+	// tool continues to use the separate tool watchdog budget.
+	IdleWatchdogTimeout time.Duration
+	// HandshakeTimeout bounds startup RPCs for providers with a long-lived
+	// protocol transport. It is currently consumed by Codex app-server;
+	// zero uses the provider default rather than disabling the bound.
+	HandshakeTimeout time.Duration
+	ResumeSessionID  string // if non-empty, resume a previous agent session
+	// ResumeExpected records that this task intended to continue a prior
+	// conversation, independent of ResumeSessionID (which a fallback retry may
+	// clear). When it is true but the backend ends up on a fresh thread — the
+	// live resume RPC was rejected, or a transport failure forced a fresh retry —
+	// the backend surfaces a continuity notice instead of silently
+	// restarting. Currently honoured by the codex backend (MUL-4424).
+	ResumeExpected bool
+	// ResumeContinuityNotice is the text to prepend to the first turn when
+	// ResumeExpected holds but the backend lands on a fresh thread anyway. The
+	// caller owns the wording because only it knows what the surface lost — an
+	// issue's comments and a Slack channel's history survive and can be re-read,
+	// a web chat's and a Feishu channel's cannot — and that difference decides
+	// whether the agent should tell the user anything at all (MUL-5722).
+	//
+	// Empty means say nothing, and the caller MUST leave it empty when its own
+	// prompt already carries the notice. That is what keeps a turn from paying
+	// for the same paragraph twice: the daemon injects it whenever it already
+	// knows the resume is gone, and the backend covers only the case the daemon
+	// cannot see — a live resume RPC rejected mid-run.
+	ResumeContinuityNotice string
+	// ExtraArgs is honoured only by backends that opt in by reading it; the
+	// rest ignore it. Deliberately not enumerated here — the previous list
+	// went stale as backends were added, which is how MULTICA_QWENPAW_ARGS
+	// shipped plumbed but dropped. Grep for ExtraArgs to see today's set.
+	ExtraArgs        []string        // daemon-wide default CLI arguments appended before CustomArgs
+	CustomArgs       []string        // per-agent CLI arguments appended after ExtraArgs
+	QwenpawWorkspace string          // per-task QwenPaw workspace directory (passed as --workspace to qwenpaw acp); empty when not applicable
+	McpConfig        json.RawMessage // if non-nil, MCP server config to pass via --mcp-config
+	// ThinkingLevel is the runtime-native reasoning/effort value (e.g.
+	// Claude's "low|medium|high|xhigh|max", Codex's "none|minimal|low|
+	// medium|high|xhigh", OpenCode's model variant names). Empty means
+	// "use the runtime/model default" —
+	// every backend that consumes this skips its --effort / reasoning_effort
+	// injection so the upstream CLI's own default applies. Currently honoured
+	// by the claude, codex, opencode, codebuddy, dsh, and grok (ACP
+	// `--effort` on `grok agent`) backends; other backends ignore
+	// the field rather than fail (so MUL-2339 can grow runtime support
+	// incrementally without breaking unrelated agents).
+	ThinkingLevel string
+	// ServiceTier is a runtime-native Codex execution tier (for example
+	// "priority", displayed as Fast). Empty means inherit local Codex config.
+	// Other providers ignore this field.
+	ServiceTier string
+	// OpenclawMode chooses between local (embedded) and gateway routing for
+	// the openclaw backend. "" or "local" keeps the historical behaviour —
+	// the daemon spawns `openclaw agent --local …` and the agent loop runs
+	// in-process on the daemon host. "gateway" instructs the daemon to drop
+	// the --local flag and let openclaw route the turn through a Gateway (the
+	// user's globally-configured one, or an endpoint pinned in the per-task
+	// config wrapper that the daemon writes from execenv.OpenclawGatewayPin —
+	// see server/internal/daemon/execenv/openclaw_config.go). Other backends
+	// ignore this field, mirroring ThinkingLevel's renderer-side fall-through
+	// pattern. See issue #3260.
+	OpenclawMode string
+	// ClaudeSettingsPath is a daemon-owned, task-local settings file passed
+	// through Claude Code's --settings flag. It currently carries restrictive
+	// runtime-skill overrides only; other providers ignore it.
+	ClaudeSettingsPath string
 }
 
+// runContext derives the execution context for an agent subprocess from the
+// configured per-run timeout. A positive timeout imposes a hard wall-clock
+// deadline; a zero (or negative) timeout imposes NO deadline, leaving liveness
+// entirely to the daemon's inactivity watchdog so a session that keeps emitting
+// events is never killed merely for running long (MUL-3064). The caller owns
+// the returned CancelFunc and must call it to release resources.
+func runContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout > 0 {
+		return context.WithTimeout(ctx, timeout)
+	}
+	return context.WithCancel(ctx)
+}
+
+// ControlOperation is a provider-neutral request to cooperatively steer an active session.
 type ControlOperation string
 
 const (
@@ -75,576 +144,419 @@ const (
 )
 
 var (
-	ErrControlUnsupported     = errors.New("agent control unsupported")
-	ErrControlInactive        = errors.New("agent control session inactive")
+	ErrControlUnsupported     = errors.New("agent session control is unsupported")
+	ErrControlInactive        = errors.New("agent session is not active")
 	ErrControlRequestConflict = errors.New("agent control request id reused with different payload")
 )
 
-// ControlRequest is the provider-neutral cooperative control request. The
-// expected provider identity fields are mandatory compare-and-swap guards for
-// adapters that expose an active provider turn. Providers without native turn
-// identity may leave ExpectedProviderTurnID empty and must document their
-// boundary evidence in ControlResult.
+// ControlRequest is deliberately provider-neutral. RequestID is the caller's
+// stable idempotency key; provider identity fields prevent cross-session writes.
 type ControlRequest struct {
-	RequestID                 string           `json:"requestId"`
-	Operation                 ControlOperation `json:"operation"`
-	Instruction               string           `json:"instruction,omitempty"`
-	ExpectedProviderSessionID string           `json:"expectedProviderSessionId"`
-	ExpectedProviderTurnID    string           `json:"expectedProviderTurnId,omitempty"`
+	RequestID                 string
+	Operation                 ControlOperation
+	Instruction               string
+	ExpectedProviderSessionID string
+	ExpectedProviderTurnID    string
 }
 
-// ControlResult reports only provider-native evidence. Process exit, local
-// signals, and caller-side resume heuristics are not valid acceptance evidence.
+// ControlResult records only provider-confirmed control outcomes. Accepted is
+// never inferred from context cancellation, signals, or process termination.
 type ControlResult struct {
-	Provider          string    `json:"provider"`
-	ProviderSessionID string    `json:"providerSessionId"`
-	ProviderTurnID    string    `json:"providerTurnId,omitempty"`
-	Accepted          bool      `json:"accepted"`
-	BoundaryKind      string    `json:"boundaryKind,omitempty"`
-	TerminalEvidence string    `json:"terminalEvidence,omitempty"`
-	ResumableEvidence string   `json:"resumableEvidence,omitempty"`
-	Timestamp         time.Time `json:"timestamp"`
+	Provider          string
+	ProviderSessionID string
+	ProviderTurnID    string
+	Accepted          bool
+	BoundaryKind      string
+	TerminalEvidence  string
+	ResumableEvidence string
+	Timestamp         time.Time
 }
 
-func (r ControlRequest) validate() error {
-	if strings.TrimSpace(r.RequestID) == "" {
+// validateControlRequest rejects malformed work before it can reach a provider.
+func validateControlRequest(request ControlRequest) error {
+	if strings.TrimSpace(request.RequestID) == "" {
 		return fmt.Errorf("control request id is required")
 	}
-	switch r.Operation {
+	switch request.Operation {
 	case ControlCheckpoint, ControlCancelAndRedirect:
-		if strings.TrimSpace(r.Instruction) == "" {
-			return fmt.Errorf("control instruction is required for %s", r.Operation)
+		if strings.TrimSpace(request.Instruction) == "" {
+			return fmt.Errorf("control instruction is required for %s", request.Operation)
 		}
 	case ControlInterrupt:
 	default:
-		return fmt.Errorf("unsupported control operation %q", r.Operation)
+		return fmt.Errorf("unknown control operation %q", request.Operation)
 	}
 	return nil
 }
 
 type sessionControlFunc func(context.Context, ControlRequest) (ControlResult, error)
 
-type sessionControlCacheEntry struct {
-	request ControlRequest
-	result  ControlResult
-	err     error
-}
-
+// Session represents a running agent execution.
 type Session struct {
+	// Messages streams events as the agent works. The channel is closed
+	// when the agent finishes (before Result is sent).
 	Messages <-chan Message
-	Result   <-chan Result
-	control  sessionControlFunc
-
-	controlMu    sync.Mutex
-	controlCache map[string]sessionControlCacheEntry
+	// Result receives exactly one value — the final outcome — then closes.
+	Result  <-chan Result
+	control sessionControlFunc
 }
 
-// Control asks the active provider session to cooperatively checkpoint,
-// redirect, or interrupt. Unsupported and inactive sessions fail closed.
+// Control delegates to the active provider transport. Unsupported providers do
+// no I/O; validation happens before the provider handler is called.
 func (s *Session) Control(ctx context.Context, request ControlRequest) (ControlResult, error) {
-	if err := request.validate(); err != nil {
+	if err := validateControlRequest(request); err != nil {
+		return ControlResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return ControlResult{}, err
 	}
 	if s == nil || s.control == nil {
 		return ControlResult{}, ErrControlUnsupported
 	}
+	return s.control(ctx, request)
+}
 
-	// A control request ID is a durable idempotency key for this live session.
-	// Serialize first execution and cache both success and failure so a caller
-	// cannot ambiguously resend provider control after losing the first reply.
-	s.controlMu.Lock()
-	defer s.controlMu.Unlock()
-	if cached, ok := s.controlCache[request.RequestID]; ok {
-		if cached.request != request {
-			return ControlResult{}, ErrControlRequestConflict
+// MessageType identifies the kind of Message.
+type MessageType string
+
+const (
+	MessageText       MessageType = "text"
+	MessageThinking   MessageType = "thinking"
+	MessageToolUse    MessageType = "tool-use"
+	MessageToolResult MessageType = "tool-result"
+	MessageStatus     MessageType = "status"
+	MessageError      MessageType = "error"
+	MessageLog        MessageType = "log"
+)
+
+// Message is a unified event emitted by an agent during execution.
+type Message struct {
+	Type      MessageType
+	Content   string         // text content (Text, Error, Log)
+	Tool      string         // tool name (ToolUse, ToolResult)
+	CallID    string         // tool call ID (ToolUse, ToolResult)
+	Input     map[string]any // tool input (ToolUse)
+	Output    string         // tool output (ToolResult)
+	Status    string         // agent status string (Status)
+	Level     string         // log level (Log)
+	SessionID string         // backend session id (Status), for early resume-pointer pinning
+}
+
+// TokenUsage tracks token consumption for a single model.
+type TokenUsage struct {
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	// CostUSDTicks is the provider's own statement of what this usage cost,
+	// in ticks of 1e-10 USD. Zero means "not reported" — only a few agents
+	// return it (xAI Grok Build does, via `_meta.usage.costUsdTicks`).
+	//
+	// It matters because a token-times-rate estimate cannot reproduce
+	// request-level pricing rules. xAI bills a request at 2x once its prompt
+	// reaches 200K tokens, and a usage record aggregates every model call in
+	// a turn — so the stored token counts cannot say which tier any single
+	// request hit. The provider's own figure already has that priced in.
+	CostUSDTicks int64
+}
+
+// CostUSDTicksPerUSD is the scale of the provider-reported cost unit: xAI
+// reports whole ticks of 1e-10 USD, which keeps sub-cent turn costs exact in
+// int64 all the way to the database instead of drifting through float64.
+const CostUSDTicksPerUSD = 10_000_000_000
+
+// Result is the final outcome after an agent session completes.
+type Result struct {
+	Status     string // "completed", "failed", "aborted", "timeout", "cancelled"
+	Output     string // final user-facing output selected by the backend
+	Error      string // error message if failed
+	DurationMs int64
+	SessionID  string
+	Usage      map[string]TokenUsage // keyed by model name
+	// ResumeRejected is positive evidence that this run's requested resume
+	// was itself refused — the transcript is gone, the session belongs to
+	// another provider account, OR the session still exists but its history
+	// can no longer be replayed to the provider (e.g. GH #5975: a stored
+	// image now exceeds the provider's max dimensions, so every resumed
+	// session/prompt is rejected before the turn runs). What unites these is
+	// that the resume CANNOT continue and only starting over can cure it, so
+	// it is what the daemon's fresh-session fallback looks for first. Note the
+	// last case keeps a non-empty SessionID (the id is real, only its history
+	// is unusable) — the daemon gates on this boolean, not an empty id.
+	//
+	// false is NOT evidence of the opposite. For a backend listed in
+	// ResumeRejectionUndetectable it means "could not tell"; for every other
+	// backend it means "checked, and this was not a rejection". The daemon
+	// needs the provider name to tell those apart — see
+	// shouldRetryWithFreshSession in internal/daemon.
+	//
+	// Backends must NOT set it for failures a new session cannot cure:
+	// network drops, rate limits, quota, provider 5xx, or auth errors. Those
+	// keep the session pointer so the platform's own retry can resume the
+	// truncated conversation (see retryableReasons in internal/service/task.go).
+	//
+	// The auth exclusion above stands even for the one auth error a fresh
+	// session DOES cure — a resumed session whose persisted provider identity
+	// can no longer resolve its credentials (GH #6777). An adapter cannot tell
+	// that apart from a genuinely bad credential by looking at the error, so
+	// the judgement is made once, provider-agnostically, in
+	// shouldRetryWithFreshSession, where "was this run a resume?" is already
+	// known. Do not encode it here.
+	ResumeRejected bool
+	// codexInitializeRetrySafe is provider-internal evidence that an
+	// initialize timeout happened before semantic activity and after the
+	// process tree was reaped. It is intentionally not part of the public
+	// result contract.
+	codexInitializeRetrySafe bool
+	// codexStartupRefreshRetrySafe is provider-internal evidence that the
+	// first turn produced no semantic progress because Codex could not load
+	// its model catalog, and that the process tree was reaped afterwards.
+	// Like codexInitializeRetrySafe it is not part of the public contract.
+	codexStartupRefreshRetrySafe bool
+}
+
+// Config configures a Backend instance.
+type Config struct {
+	ExecutablePath string            // path to CLI binary (claude, codebuddy, codex, copilot, opencode, openclaw, hermes, pi, cursor, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, zeroclaw)
+	CLIVersion     string            // detected version paired with ExecutablePath; observation only, never used to choose behavior
+	Env            map[string]string // extra environment variables
+	Logger         *slog.Logger
+	TaskID         string
+	RuntimeID      string
+	DaemonVersion  string
+	CodexVersion   string
+	// BuiltinRuntime reports that ExecutablePath is the provider's own
+	// discovered binary rather than a custom runtime profile's command. A
+	// custom profile keeps its protocol family as the provider, so the
+	// provider name cannot distinguish the two: `protocol_family: hermes`
+	// with `command_name: jcode` arrives as "hermes" while being an
+	// unrelated implementation. Backends use this to scope
+	// compatibility exceptions that were verified against a specific
+	// vendor's binary; it defaults to false so an unset caller fails
+	// closed onto standard behavior.
+	BuiltinRuntime bool
+	// provider is the runtime/provider identity used in safe launch logs. New
+	// fills it from the protocol family; NewRuntime preserves the concrete
+	// built-in runtime identity instead (for example omp rather than pi).
+	provider string
+	// LaunchPrefix is the argv prefix that belongs to ExecutablePath itself —
+	// a custom runtime profile's fixed_args. It is spliced in directly after
+	// the executable, ahead of every argument a backend builds, because a
+	// wrapper's subcommand has to be consumed before the wrapped CLI's own
+	// flags mean anything (`ccms start q36` then `-p …`, GH #7046).
+	//
+	// Unlike ExtraArgs this is not opt-in: New filters it once and the
+	// Command boundary applies it to every process the package spawns, task
+	// launches and CLI probes alike. Backends never read it directly.
+	LaunchPrefix []string
+}
+
+// New creates a Backend for the given agent type.
+// Supported types: "claude", "codebuddy", "codex", "copilot", "opencode", "deveco", "openclaw", "hermes", "pi", "cursor", "kimi", "reasonix", "dsh", "kiro", "antigravity", "qoder", "qoderclicn", "traecli", "grok", "qwen", "qwenpaw", "mcode".
+//
+// SupportedTypes is the canonical whitelist of agent types eligible to back a
+// custom runtime profile. It MUST stay in lockstep with the
+// runtime_profile.protocol_family CHECK constraint (migration 120, widened by
+// migration 134 to add qoder, migration 136 to add traecli, migration 175 to
+// add deveco, migration 179 to add grok, migration 202 to add qwen,
+// migration 242 to add qoderclicn, migration 253 to add qwenpaw,
+// migration 254 to add reasonix, migration 313 to add dsh, migration 327 to
+// add mcode, migration 370 to add dim, migration 403 to add zeroclaw): a
+// custom runtime profile may only
+// be based on a backend Multica officially supports.
+// qoder and qoderclicn share the same ACP backend; keeping both provider keys
+// lets the daemon auto-detect and register the international and China-region
+// binaries independently. traecli (Trae) has a New backend, launch
+// header and provider branding but was previously missing from this whitelist,
+// so the family picker rejected it (#4945). grok is the xAI Grok Build CLI
+// ACP backend (`grok agent --always-approve stdio`). qwen is Qwen Code's
+// native `qwen -p <prompt> --output-format stream-json` backend.
+var SupportedTypes = []string{
+	"claude",
+	"codebuddy",
+	"codex",
+	"copilot",
+	"opencode",
+	"deveco",
+	"openclaw",
+	"hermes",
+	"pi",
+	"cursor",
+	"kimi",
+	"reasonix",
+	"dsh",
+	"kiro",
+	"antigravity",
+	"qoder",
+	"qoderclicn",
+	"traecli",
+	"grok",
+	"qwen",
+	"qwenpaw",
+	"mcode",
+	"dim",
+	"zeroclaw",
+}
+
+// IsSupportedType reports whether agentType is in the SupportedTypes whitelist.
+// Used to validate a custom runtime profile's protocol_family before it is
+// persisted or registered.
+func IsSupportedType(agentType string) bool {
+	for _, t := range SupportedTypes {
+		if t == agentType {
+			return true
 		}
-		return cached.result, cached.err
 	}
-
-	result, err := s.control(ctx, request)
-	if s.controlCache == nil {
-		s.controlCache = make(map[string]sessionControlCacheEntry)
-	}
-	s.controlCache[request.RequestID] = sessionControlCacheEntry{
-		request: request,
-		result:  result,
-		err:     err,
-	}
-	return result, err
+	return false
 }
 
-// ExecOptions configures the agent execution.
-type ExecOptions struct {
-	Provider        types.AgentProvider
-	Prompt          string
-	RepoRoot        string
-	Model           string
-	MaxTurns        int
-	Timeout         time.Duration
-	StallTimeout    time.Duration
-	PermissionMode  string
-	AllowedTools    []string
-	DisallowedTools []string
-	SystemPrompt    string
-
-	// AppendSystemPrompt is appended to the provider's default system prompt.
-	// Unlike SystemPrompt (which replaces the default), this preserves the
-	// provider's built-in instructions while adding task-specific guidance.
-	AppendSystemPrompt string
-
-	// SettingSources controls which Claude Code settings are loaded.
-	// Values: "user" (~/.claude/settings.json), "project" (.claude/settings.json),
-	// "local" (.claude/settings.local.json). When nil, defaults to ["project"].
-	// Set empty slice to load no settings.
-	SettingSources []string
-
-	// CLAUDE.md source policy. When nil, agent-level defaults apply.
-	// Values: "user", "project", "local".
-	ClaudeMDSettingSources []string
-
-	// MCP source contract.
-	McpMode                types.McpMode
-	McpPreset              string
-	McpServers             []types.McpServerConfig
-	StrictMcpConfig        bool
-	AllowRemoteMcp         bool
-	AllowUnpinnedRemoteMcp bool
-	ClaudeSettingsPath     string
-	ClaudeMcpConfigPath    string
-
-	// Plugin directories to load for the execution. Each path is passed to the
-	// CLI as --plugin-dir. Paths must exist and be directories.
-	PluginDirs []string
-
-	// PersistSession enables provider session storage for later resume.
-	PersistSession bool
-	// ResumeSessionID is the provider session to continue when non-empty.
-	ResumeSessionID string
-
-	// CodexHomeMode controls how CODEX_HOME is selected for Codex executions.
-	// Empty defaults to "task", which isolates state per task and prevents
-	// credentials/history from leaking across executions. "inherit" is an
-	// explicit compatibility escape hatch for trusted environments.
-	CodexHomeMode string
-	// CodexHomeRoot is the parent directory for task-scoped Codex homes.
-	// Empty defaults under MULTICA_HOME, then MULTICA_DATA_DIR, then the OS temp dir.
-	CodexHomeRoot string
-	// CodexHomeTaskID identifies the task-scoped Codex home.
-	// Empty values are auto-generated.
-	CodexHomeTaskID string
-
-	// CodexUsesChatGPTAuth controls auth preflight for the Codex CLI.
-	// When true, account login state is required (OPENAI_API_KEY-only is rejected).
-	// When false, either OPENAI_API_KEY or account login state is accepted.
-	CodexUsesChatGPTAuth bool
-
-	// CodexChatGPTAuthFile is a path to a pre-authenticated Codex auth.json.
-	// When CodexUsesChatGPTAuth is true, the file is copied into the task-scoped
-	// CODEX_HOME before execution. This enables account auth in isolated homes
-	// without sharing the entire user CODEX_HOME directory.
-	CodexChatGPTAuthFile string
-
-	// CodexRealtimeConversation is required to enable realtime conversation features.
-	CodexRealtimeConversation bool
+// resumeRejectionUndetectable lists the backends that cannot produce
+// Result.ResumeRejected at all. They scrape SessionID out of stream output and
+// have no rejection detection: no phrase match, no structured error code, no
+// internal restart. copilot's own comment documents the hole (a session.error
+// arriving before session.start leaves SessionID empty), and antigravity's
+// conversation-id reader returns "" whenever the CLI exits before dispatching.
+//
+// Membership is deliberately opt-in. A backend absent from this map is treated
+// as capable, so a new backend fails closed — it reports no rejection and gets
+// no fallback — rather than silently inheriting a guess-based retry. Remove an
+// entry as soon as its backend learns to report rejections.
+var resumeRejectionUndetectable = map[string]bool{
+	"antigravity": true,
+	"copilot":     true,
+	"cursor":      true,
+	"deveco":      true,
+	"opencode":    true,
 }
 
-// Agent is the interface for executing AI agents.
-type Agent interface {
-	Execute(ctx context.Context, opts ExecOptions) (*Session, error)
+// ResumeRejectionUndetectable reports whether agentType is a backend that
+// cannot tell a refused resume from any other startup failure. Callers use it
+// to read a false Result.ResumeRejected correctly: "could not tell" for these,
+// "checked, not a rejection" for everything else.
+func ResumeRejectionUndetectable(agentType string) bool {
+	return resumeRejectionUndetectable[agentType]
 }
 
-// New creates an Agent for the given provider.
-func New(provider types.AgentProvider, env map[string]string) (Agent, error) {
-	switch provider {
-	case types.AgentProviderClaude:
-		return NewClaudeAgent(env), nil
-	case types.AgentProviderCodex:
-		return NewCodexAgent(env), nil
-	case types.AgentProviderCursor:
-		return NewCursorAgent(env), nil
-	case types.AgentProviderGemini:
-		return NewGeminiAgent(env), nil
-	case types.AgentProviderCopilot:
-		return NewCopilotAgent(env), nil
+func New(agentType string, cfg Config) (Backend, error) {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.provider == "" {
+		cfg.provider = agentType
+	}
+	// Filter the launch prefix here, at the one point that knows both the
+	// prefix and the protocol family. Doing it per-backend would be the same
+	// opt-in arrangement that let ExtraArgs rot: a family that forgot the call
+	// would accept a fixed_args `--output-format text` and break its own
+	// stream-json channel.
+	cfg.LaunchPrefix = filterLaunchPrefix(cfg.LaunchPrefix, agentType, cfg.Logger)
+
+	switch agentType {
+	case "claude":
+		return &claudeBackend{cfg: cfg}, nil
+	case "codebuddy":
+		return &codebuddyBackend{cfg: cfg}, nil
+	case "codex":
+		return &codexBackend{cfg: cfg}, nil
+	case "copilot":
+		return &copilotBackend{cfg: cfg}, nil
+	case "opencode":
+		return &opencodeBackend{cfg: cfg}, nil
+	case "deveco":
+		return &devecoBackend{cfg: cfg}, nil
+	case "openclaw":
+		return &openclawBackend{cfg: cfg}, nil
+	case "hermes":
+		return &hermesBackend{cfg: cfg}, nil
+	case "pi":
+		return &piBackend{cfg: cfg}, nil
+	case "cursor":
+		return &cursorBackend{cfg: cfg}, nil
+	case "kimi":
+		return &kimiBackend{cfg: cfg}, nil
+	case "reasonix":
+		return &reasonixBackend{cfg: cfg}, nil
+	case "dsh":
+		return &dshBackend{cfg: cfg}, nil
+	case "dim":
+		return &dimBackend{cfg: cfg}, nil
+	case "kiro":
+		return &kiroBackend{cfg: cfg}, nil
+	case "antigravity":
+		return &antigravityBackend{cfg: cfg}, nil
+	case "qoder", "qoderclicn":
+		return &qoderBackend{cfg: cfg, defaultExecutable: qoderDefaultBinary(agentType)}, nil
+	case "traecli":
+		return &traecliBackend{cfg: cfg}, nil
+	case "grok":
+		return &grokBackend{cfg: cfg}, nil
+	case "qwen":
+		return &qwenBackend{cfg: cfg}, nil
+	case "qwenpaw":
+		return &qwenpawBackend{cfg: cfg}, nil
+	case "mcode":
+		return &mcodeBackend{cfg: cfg}, nil
+	case "zeroclaw":
+		return &zeroclawBackend{cfg: cfg}, nil
 	default:
-		return nil, fmt.Errorf("unsupported agent provider: %s", provider)
+		return nil, fmt.Errorf("unknown agent type: %q (supported: %s)", agentType, strings.Join(SupportedTypes, ", "))
 	}
 }
 
-// NewDefault creates the default Agent implementation.
-func NewDefault() Agent {
-	return NewClaudeAgent(nil)
+// DetectVersion runs the agent CLI with --version and returns the output.
+//
+// cmd carries the runtime's launch prefix, so a custom profile is probed the
+// way it is launched: `ccms start q36 --version` reports the version of the
+// CLI the wrapper actually execs, where a bare `ccms --version` would report
+// the wrapper's own and pin the runtime to the wrong compatibility policy.
+func DetectVersion(ctx context.Context, cmd Command) (string, error) {
+	return detectCLIVersion(ctx, cmd)
 }
 
-func normalizeOpts(opts *ExecOptions) {
-	if opts.MaxTurns <= 0 {
-		opts.MaxTurns = 50
-	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = 30 * time.Minute
-	}
-	if opts.StallTimeout <= 0 {
-		opts.StallTimeout = 10 * time.Minute
-	}
-	if opts.PermissionMode == "" {
-		opts.PermissionMode = "bypassPermissions"
-	}
-	if opts.SettingSources == nil {
-		opts.SettingSources = []string{"project"}
-	}
-	if opts.ClaudeMDSettingSources == nil {
-		opts.ClaudeMDSettingSources = []string{"project"}
-	}
-	if opts.McpMode == "" {
-		opts.McpMode = types.McpModeNone
-	}
+// launchHeaders maps each supported agent type to the user-visible skeleton
+// that the daemon spawns before any custom_args are appended. This is
+// intentionally minimal — only the command + subcommand (or a short mode
+// label when there is no subcommand). Internal flags, transport values, and
+// environment variables are deliberately omitted so the string is a hint
+// about *what* users are extending, not a dump of the full command line.
+var launchHeaders = map[string]string{
+	"antigravity": "agy -p (non-interactive)",
+	"claude":      "claude (stream-json)",
+	"codebuddy":   "codebuddy (stream-json)",
+	"codex":       "codex app-server",
+	"copilot":     "copilot (json)",
+	"cursor":      "cursor-agent (stream-json)",
+	"deveco":      "deveco run (json)",
+	"hermes":      "hermes acp",
+	"kimi":        "kimi acp",
+	"reasonix":    "reasonix acp",
+	"dsh":         "dsh --profile multica (stdio)",
+	"kiro":        "kiro-cli acp",
+	"openclaw":    "openclaw agent (json)",
+	"opencode":    "opencode run (json)",
+	"pi":          "pi (json mode)",
+	"qoder":       "qodercli --acp",
+	"qoderclicn":  "qoderclicn --acp",
+	"traecli":     "traecli acp serve",
+	"grok":        "grok agent stdio",
+	"qwen":        "qwen -p (stream-json)",
+	"qwenpaw":     "qwenpaw acp",
+	"dim":         "dim acp",
+	"mcode":       "mcode acp",
+	"zeroclaw":    "zeroclaw acp",
 }
 
-func validateExecOptions(opts *ExecOptions) error {
-	if opts.RepoRoot == "" {
-		return errors.New("repo root is required")
+// LaunchHeader returns the user-visible launch skeleton for agentType, or an
+// empty string if the type is unknown. Callers render this as a preview so
+// users understand which command their custom_args get appended to.
+func LaunchHeader(agentType string) string {
+	if h := launchHeaders[agentType]; h != "" {
+		return h
 	}
-	abs, err := filepath.Abs(opts.RepoRoot)
-	if err != nil {
-		return fmt.Errorf("resolve repo root: %w", err)
+	// Built-in runtime identities derive their launch header from the
+	// descriptor, not the protocol-family map.
+	if desc, ok := BuiltinRuntimeByID(agentType); ok {
+		return desc.LaunchHeader
 	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return fmt.Errorf("repo root: %w", err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("repo root is not a directory: %s", abs)
-	}
-	opts.RepoRoot = abs
-
-	switch opts.McpMode {
-	case types.McpModeNone:
-		opts.McpPreset = ""
-		opts.McpServers = nil
-	case types.McpModePreset:
-		if opts.McpPreset == "" {
-			return errors.New("mcp preset is required when mcpMode is preset")
-		}
-		opts.McpServers = nil
-	case types.McpModeExplicit:
-		if len(opts.McpServers) == 0 {
-			return errors.New("at least one mcp server is required when mcpMode is explicit")
-		}
-		opts.McpPreset = ""
-	case types.McpModeDisabled:
-		opts.McpPreset = ""
-		opts.McpServers = nil
-	default:
-		return fmt.Errorf("invalid mcp mode: %s", opts.McpMode)
-	}
-
-	if err := security.ValidateMcpServers(opts.McpServers); err != nil {
-		return err
-	}
-	return nil
-}
-
-// prepareMcpConfig resolves env indirection and optionally writes a provider-specific MCP config file.
-func prepareMcpConfig(opts ExecOptions) (ExecOptions, func(), error) {
-	cleanup := func() {}
-	if opts.McpMode != types.McpModeExplicit {
-		return opts, cleanup, nil
-	}
-
-	servers, err := security.ResolveMcpEnv(opts.McpServers)
-	if err != nil {
-		return opts, cleanup, err
-	}
-	opts.McpServers = servers
-
-	switch opts.Provider {
-	case types.AgentProviderClaude:
-		if opts.ClaudeMcpConfigPath == "" {
-			path, err := writeTempMcpConfig(opts.McpServers)
-			if err != nil {
-				return opts, cleanup, err
-			}
-			opts.ClaudeMcpConfigPath = path
-			cleanup = func() { _ = os.Remove(path) }
-		}
-	case types.AgentProviderGemini:
-		return opts, cleanup, errors.New("explicit MCP mode is not supported by Gemini provider")
-	case types.AgentProviderCopilot:
-		return opts, cleanup, errors.New("explicit MCP mode is not supported by Copilot provider")
-	}
-
-	return opts, cleanup, nil
-}
-
-// BaseAgent provides common functionality for agent implementations.
-type BaseAgent struct {
-	env map[string]string
-}
-
-func NewBaseAgent(env map[string]string) *BaseAgent {
-	return &BaseAgent{env: env}
-}
-
-func (a *BaseAgent) envSlice() []string {
-	env := os.Environ()
-	for k, v := range a.env {
-		env = append(env, k+"="+v)
-	}
-	return env
-}
-
-func (a *BaseAgent) envMap() map[string]string {
-	env := make(map[string]string)
-	for _, item := range os.Environ() {
-		if idx := strings.IndexByte(item, '='); idx >= 0 {
-			env[item[:idx]] = item[idx+1:]
-		}
-	}
-	for k, v := range a.env {
-		env[k] = v
-	}
-	return env
-}
-
-func sendMessage(ch chan<- Message, msg Message) bool {
-	select {
-	case ch <- msg:
-		return true
-	default:
-		return false
-	}
-}
-
-// putMessage delivers a message without dropping it, unless the execution context
-// is canceled. This applies backpressure to the provider reader so API callers do
-// not silently lose events when channels are temporarily full.
-func putMessage(ctx context.Context, ch chan<- Message, msg Message) bool {
-	select {
-	case ch <- msg:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
-func putResult(ch chan<- Result, result Result) {
-	ch <- result
-}
-
-func safeCloseMessages(ch chan Message) {
-	defer func() { _ = recover() }()
-	close(ch)
-}
-
-func safeCloseResult(ch chan Result) {
-	defer func() { _ = recover() }()
-	close(ch)
-}
-
-// parseJSONLine attempts to parse a JSON line.
-func parseJSONLine(line string, v any) error {
-	dec := jsonDecoder(strings.NewReader(line))
-	dec.UseNumber()
-	return dec.Decode(v)
-}
-
-// jsonDecoder is a small seam for tests.
-var jsonDecoder = func(r io.Reader) *json.Decoder {
-	return json.NewDecoder(r)
-}
-
-// redactForLogs applies shared masking to stderr or provider output that may
-// include secrets. Keep this in the agent package so every provider path can
-// consistently protect logs.
-func redactForLogs(raw string) string {
-	return masking.MaskSecrets(raw)
-}
-
-var numericValuePattern = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?`)
-
-func parseExactDecimalTicks(value string, scale int64) (int64, bool) {
-	value = strings.TrimSpace(value)
-	if value == "" || !numericValuePattern.MatchString(value) || numericValuePattern.FindString(value) != value {
-		return 0, false
-	}
-
-	negative := false
-	if value[0] == '-' || value[0] == '+' {
-		negative = value[0] == '-'
-		value = value[1:]
-	}
-
-	exponent := 0
-	if idx := strings.IndexAny(value, "eE"); idx >= 0 {
-		parsed, err := strconv.Atoi(value[idx+1:])
-		if err != nil {
-			return 0, false
-		}
-		exponent = parsed
-		value = value[:idx]
-	}
-
-	parts := strings.SplitN(value, ".", 2)
-	digits := parts[0]
-	fractionDigits := 0
-	if len(parts) == 2 {
-		digits += parts[1]
-		fractionDigits = len(parts[1])
-	}
-	digits = strings.TrimLeft(digits, "0")
-	if digits == "" {
-		return 0, true
-	}
-
-	scaleDigits := len(strconv.FormatInt(scale, 10)) - 1
-	shift := exponent - fractionDigits + scaleDigits
-	if shift < 0 {
-		cut := len(digits) + shift
-		if cut <= 0 {
-			return 0, true
-		}
-		digits = digits[:cut]
-	} else if shift > 0 {
-		digits += strings.Repeat("0", shift)
-	}
-
-	parsed, err := strconv.ParseInt(digits, 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	if negative {
-		parsed = -parsed
-	}
-	return parsed, true
-}
-
-func parseUsageValue(value any) (int64, bool) {
-	switch v := value.(type) {
-	case json.Number:
-		i, err := v.Int64()
-		return i, err == nil
-	case float64:
-		return int64(v), true
-	case int:
-		return int64(v), true
-	case int64:
-		return v, true
-	case string:
-		i, err := strconv.ParseInt(v, 10, 64)
-		return i, err == nil
-	default:
-		return 0, false
-	}
-}
-
-func parseCostTicks(value any) (int64, bool) {
-	const costScale = int64(10_000_000_000)
-	switch v := value.(type) {
-	case json.Number:
-		return parseExactDecimalTicks(v.String(), costScale)
-	case float64:
-		return parseExactDecimalTicks(strconv.FormatFloat(v, 'g', -1, 64), costScale)
-	case string:
-		return parseExactDecimalTicks(v, costScale)
-	default:
-		return 0, false
-	}
-}
-
-func mergeUsage(dst map[string]int64, src map[string]any) {
-	for key, value := range src {
-		if count, ok := parseUsageValue(value); ok {
-			dst[key] += count
-		}
-	}
-}
-
-func failureResult(provider types.AgentProvider, err error) Result {
-	normalized := agentfailure.Normalize(err)
-	status := StatusFailed
-	if errors.Is(normalized, agenterr.ErrStall) {
-		status = StatusTimedOut
-	}
-	return Result{
-		Status: status,
-		Error:  normalized.Error(),
-	}
-}
-
-func executeWithLifecycle(ctx context.Context, opts ExecOptions, execute func(context.Context, ExecOptions) (*Session, error)) (*Session, error) {
-	normalizeOpts(&opts)
-	if err := validateExecOptions(&opts); err != nil {
-		return nil, err
-	}
-
-	prepared, cleanup, err := prepareMcpConfig(opts)
-	if err != nil {
-		return nil, err
-	}
-
-	session, err := execute(ctx, prepared)
-	if err != nil {
-		cleanup()
-		return nil, err
-	}
-
-	messages := make(chan Message, 128)
-	results := make(chan Result, 1)
-	go func() {
-		defer safeCloseMessages(messages)
-		defer safeCloseResult(results)
-		defer cleanup()
-
-		for msg := range session.Messages {
-			if !putMessage(ctx, messages, msg) {
-				return
-			}
-		}
-
-		select {
-		case result, ok := <-session.Result:
-			if !ok {
-				putResult(results, Result{Status: StatusFailed, Error: "agent result channel closed unexpectedly"})
-				return
-			}
-			putResult(results, result)
-		case <-ctx.Done():
-			putResult(results, Result{Status: StatusAborted, Error: ctx.Err().Error()})
-		}
-	}()
-
-	return &Session{
-		Messages: messages,
-		Result:   results,
-		control:  session.control,
-	}, nil
-}
-
-func providerLabel(provider types.AgentProvider) string {
-	if provider == "" {
-		return "agent"
-	}
-	return string(provider)
-}
-
-func logProviderFailure(provider types.AgentProvider, err error) {
-	if err == nil {
-		return
-	}
-	log.Printf("[%s] %s", providerLabel(provider), redactForLogs(err.Error()))
-}
-
-func providerError(provider types.AgentProvider, err error) error {
-	if err == nil {
-		return nil
-	}
-	logProviderFailure(provider, err)
-	return fmt.Errorf("%s execution failed: %w", providerLabel(provider), err)
-}
-
-func localizeError(err error) string {
-	if err == nil {
-		return ""
-	}
-	return i18n.T("agent.error.execution_failed") + ": " + err.Error()
+	return ""
 }

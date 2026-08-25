@@ -5674,3 +5674,99 @@ func TestCodexResumeOverflowErrorMatchesLiveFailureText(t *testing.T) {
 		t.Fatalf("predicate missed the error the backend actually produced: %q", result.Error)
 	}
 }
+
+func TestCodexControlSteerUsesV2ShapeAndCorrelatesCompletion(t *testing.T) {
+	c, stdin, _ := newTestCodexClient(t)
+	c.threadID, c.turnID = "thread-1", "turn-1"
+	c.controlRequests = make(map[string]*codexControlRequest)
+	c.completionWaiters = make(map[string]map[chan codexCompletedEvent]struct{})
+	req := ControlRequest{RequestID: "stable-request", Operation: ControlCheckpoint, Instruction: "checkpoint now", ExpectedProviderSessionID: "thread-1", ExpectedProviderTurnID: "turn-1"}
+	result := make(chan struct {
+		r ControlResult
+		e error
+	}, 1)
+	go func() {
+		r, e := c.control(context.Background(), req)
+		result <- struct {
+			r ControlResult
+			e error
+		}{r, e}
+	}()
+	var frame map[string]any
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		lines := stdin.Lines()
+		if len(lines) > 0 {
+			_ = json.Unmarshal([]byte(lines[0]), &frame)
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if frame["method"] != "turn/steer" {
+		t.Fatalf("method = %v", frame["method"])
+	}
+	params := frame["params"].(map[string]any)
+	if params["threadId"] != "thread-1" || params["expectedTurnId"] != "turn-1" || params["clientUserMessageId"] != "stable-request" {
+		t.Fatalf("wrong steer params: %#v", params)
+	}
+	input := params["input"].([]any)
+	if len(input) != 1 || input[0].(map[string]any)["type"] != "text" || input[0].(map[string]any)["text"] != "checkpoint now" {
+		t.Fatalf("wrong typed input: %#v", input)
+	}
+	id := int(frame["id"].(float64))
+	c.handleResponse(map[string]json.RawMessage{"id": json.RawMessage(fmt.Sprintf("%d", id)), "result": json.RawMessage(`{"turnId":"turn-1"}`)})
+	c.publishCompletion(codexCompletedEvent{threadID: "thread-1", turnID: "turn-1", status: "completed"})
+	got := <-result
+	if got.e != nil || !got.r.Accepted || got.r.TerminalEvidence != "turn/completed:completed" {
+		t.Fatalf("result = %+v, %v", got.r, got.e)
+	}
+}
+
+func TestCodexControlRejectsIdentityAndConflictingRequestIDWithoutWrite(t *testing.T) {
+	c, stdin, _ := newTestCodexClient(t)
+	c.threadID, c.turnID = "thread-1", "turn-1"
+	c.controlRequests = make(map[string]*codexControlRequest)
+	for _, req := range []ControlRequest{
+		{RequestID: "one", Operation: ControlInterrupt},
+		{RequestID: "one", Operation: ControlInterrupt, ExpectedProviderSessionID: "wrong", ExpectedProviderTurnID: "turn-1"},
+	} {
+		if _, err := c.control(context.Background(), req); !errors.Is(err, ErrControlInactive) {
+			t.Fatalf("identity error = %v", err)
+		}
+	}
+	if len(stdin.Lines()) != 0 {
+		t.Fatalf("identity mismatch wrote stdin: %q", stdin.Lines())
+	}
+	c.controlRequests["one"] = &codexControlRequest{fingerprint: controlFingerprint(ControlRequest{RequestID: "one", Operation: ControlInterrupt, ExpectedProviderSessionID: "thread-1", ExpectedProviderTurnID: "turn-1"}), done: make(chan struct{})}
+	if _, err := c.control(context.Background(), ControlRequest{RequestID: "one", Operation: ControlCheckpoint, Instruction: "other", ExpectedProviderSessionID: "thread-1", ExpectedProviderTurnID: "turn-1"}); !errors.Is(err, ErrControlConflict) {
+		t.Fatalf("conflict error = %v", err)
+	}
+	if len(stdin.Lines()) != 0 {
+		t.Fatalf("conflict wrote stdin: %q", stdin.Lines())
+	}
+}
+
+func TestCodexControlInterruptRequiresEmptyRPCResultAndInterruptedCompletion(t *testing.T) {
+	c, stdin, _ := newTestCodexClient(t)
+	c.threadID, c.turnID = "thread-1", "turn-1"
+	c.controlRequests = make(map[string]*codexControlRequest)
+	c.completionWaiters = make(map[string]map[chan codexCompletedEvent]struct{})
+	req := ControlRequest{RequestID: "interrupt", Operation: ControlInterrupt, ExpectedProviderSessionID: "thread-1", ExpectedProviderTurnID: "turn-1"}
+	result := make(chan error, 1)
+	go func() { _, err := c.control(context.Background(), req); result <- err }()
+	for len(stdin.Lines()) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	var frame map[string]any
+	_ = json.Unmarshal([]byte(stdin.Lines()[0]), &frame)
+	params := frame["params"].(map[string]any)
+	if frame["method"] != "turn/interrupt" || params["threadId"] != "thread-1" || params["turnId"] != "turn-1" {
+		t.Fatalf("wrong interrupt frame: %#v", frame)
+	}
+	id := int(frame["id"].(float64))
+	c.handleResponse(map[string]json.RawMessage{"id": json.RawMessage(fmt.Sprintf("%d", id)), "result": json.RawMessage(`{}`)})
+	c.publishCompletion(codexCompletedEvent{threadID: "thread-1", turnID: "turn-1", status: "interrupted"})
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}

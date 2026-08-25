@@ -5770,3 +5770,41 @@ func TestCodexControlInterruptRequiresEmptyRPCResultAndInterruptedCompletion(t *
 		t.Fatal(err)
 	}
 }
+
+func TestCodexControlDuplicateRequestOwnsOneWriteAndStaleCompletionDoesNotAccept(t *testing.T) {
+	c, stdin, _ := newTestCodexClient(t)
+	c.threadID, c.turnID = "thread-1", "turn-1"
+	c.controlRequests = make(map[string]*codexControlRequest)
+	c.completionWaiters = make(map[string]map[chan codexCompletedEvent]struct{})
+	req := ControlRequest{RequestID: "same", Operation: ControlInterrupt, ExpectedProviderSessionID: "thread-1", ExpectedProviderTurnID: "turn-1"}
+	outcomes := make(chan error, 2)
+	for range 2 {
+		go func() { _, err := c.control(context.Background(), req); outcomes <- err }()
+	}
+	for len(stdin.Lines()) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(stdin.Lines()); got != 1 {
+		t.Fatalf("duplicate writes = %d, want 1", got)
+	}
+	var frame map[string]any
+	_ = json.Unmarshal([]byte(stdin.Lines()[0]), &frame)
+	id := int(frame["id"].(float64))
+	c.handleResponse(map[string]json.RawMessage{"id": json.RawMessage(fmt.Sprintf("%d", id)), "result": json.RawMessage(`{}`)})
+	// A burst of unrelated (including natural) completions cannot release the waiter.
+	for i := range 32 {
+		c.publishCompletion(codexCompletedEvent{threadID: "other", turnID: fmt.Sprintf("old-%d", i), status: "completed"})
+	}
+	select {
+	case err := <-outcomes:
+		t.Fatalf("stale completion accepted: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	c.publishCompletion(codexCompletedEvent{threadID: "thread-1", turnID: "turn-1", status: "interrupted"})
+	if err := <-outcomes; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-outcomes; err != nil {
+		t.Fatal(err)
+	}
+}

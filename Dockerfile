@@ -1,53 +1,44 @@
-FROM node:24.13.1-alpine AS web-builder
+# --- Build stage ---
+FROM golang:1.26-alpine AS builder
 
-WORKDIR /build
-RUN corepack enable && corepack prepare pnpm@10.24.0 --activate
+RUN apk add --no-cache git
 
-COPY pnpm-workspace.yaml pnpm-lock.yaml package.json turbo.json ./
-COPY apps/web/package.json apps/web/
-COPY packages/core/package.json packages/core/
-COPY packages/db/package.json packages/db/
-COPY packages/redis/package.json packages/redis/
-COPY packages/plugin-sdk/package.json packages/plugin-sdk/
-COPY packages/email/package.json packages/email/
-RUN pnpm install --frozen-lockfile --ignore-scripts
+WORKDIR /src
 
-COPY apps/web/ apps/web/
-COPY packages/ packages/
-RUN pnpm --filter @multica/web build
+# Cache dependencies
+COPY server/go.mod server/go.sum ./server/
+RUN cd server && go mod download
 
-FROM golang:1.26-alpine AS server-builder
+# Copy server source
+COPY server/ ./server/
 
-WORKDIR /build/server
-RUN apk add --no-cache ca-certificates git
-COPY server/go.mod server/go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
-COPY server/ ./
-COPY --from=web-builder /build/apps/web/dist ./internal/static/dist
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION:-dev}" -o /multica ./cmd/server
+# Build binaries
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG DATE=unknown
+RUN cd server && CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" -o bin/server ./cmd/server
+RUN cd server && CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" -o bin/multica ./cmd/multica
+RUN cd server && CGO_ENABLED=0 go build -ldflags "-s -w" -o bin/migrate ./cmd/migrate
+RUN cd server && CGO_ENABLED=0 go build -ldflags "-s -w" -o bin/backfill_task_usage_hourly ./cmd/backfill_task_usage_hourly
+RUN cd server && CGO_ENABLED=0 go build -ldflags "-s -w" -o bin/backfill_codex_usage_cache ./cmd/backfill_codex_usage_cache
 
-FROM alpine:3.23
+# --- Runtime stage ---
+FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates curl tzdata git openssh-client && \
-    addgroup -S multica && adduser -S multica -G multica && \
-    mkdir -p /data /app && chown -R multica:multica /data /app
+RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
-COPY --from=server-builder /multica /app/multica
-COPY deploy/docker/docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
 
-USER multica
-ENV MULTICA_DB_TYPE=sqlite \
-    MULTICA_DB_URL=/data/multica.db \
-    MULTICA_HOME=/data \
-    MULTICA_PORT=8080
+COPY --from=builder /src/server/bin/server .
+COPY --from=builder /src/server/bin/multica .
+COPY --from=builder /src/server/bin/migrate .
+COPY --from=builder /src/server/bin/backfill_task_usage_hourly .
+COPY --from=builder /src/server/bin/backfill_codex_usage_cache .
+COPY server/migrations/ ./migrations/
+COPY LICENSE NOTICE ./
+COPY docker/entrypoint.sh .
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 EXPOSE 8080
-VOLUME ["/data"]
 
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["/app/multica"]
+ENTRYPOINT ["./entrypoint.sh"]

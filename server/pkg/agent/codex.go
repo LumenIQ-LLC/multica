@@ -2172,11 +2172,20 @@ type codexClient struct {
 	// goroutines are their only readers. Turn control is driven by an unrelated
 	// caller goroutine, so it reads these instead of retrofitting a lock onto
 	// every existing access to the originals.
-	controlThreadID    codexAtomicString
-	controlTurnID      codexAtomicString
-	onMessage          func(Message)
-	onSemanticActivity func(description string)
-	onTurnDone         func(aborted bool)
+	controlThreadID codexAtomicString
+	controlTurnID   codexAtomicString
+	// controlEvidence broadcasts terminal turn events to turn-control calls
+	// waiting for proof their operation took effect on the turn they named. See
+	// codex_control.go; the publisher is the turn/completed branch of
+	// handleRawNotification.
+	controlEvidence codexControlEvidenceBus
+	// controlEvidenceTimeout bounds that wait. Zero selects the package default
+	// (codexControlEvidenceTimeout); tests set it small so the fail-closed
+	// paths do not have to wait out a production timeout.
+	controlEvidenceTimeout time.Duration
+	onMessage              func(Message)
+	onSemanticActivity     func(description string)
+	onTurnDone             func(aborted bool)
 	// onFinalAnswer fires only for an agent message the app-server itself
 	// labelled `phase: "final_answer"` — the turn's deliverable, as opposed to
 	// the intermediate agent messages that narrate work between tool calls.
@@ -3159,6 +3168,27 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 		c.cfg.Logger.Info("codex turn/completed received", "thread_id", threadID, "turn_id", turnID, "status", status)
 		aborted := status == "cancelled" || status == "canceled" ||
 			status == "aborted" || status == "interrupted"
+
+		// Publish terminal evidence to any in-flight turn-control call. This
+		// happens BEFORE the completedTurnIDs dedupe below: that dedupe exists
+		// to keep onTurnDone from firing twice, and letting it also swallow the
+		// evidence would starve a control caller that is legitimately waiting.
+		//
+		// threadId is absent on some app-server builds, and
+		// isNotificationFromOtherThread has already established that anything
+		// reaching here belongs to the tracked thread — so an absent id means
+		// "ours" and resolves to c.threadID rather than to empty, which would
+		// never correlate.
+		evidenceThreadID := threadID
+		if evidenceThreadID == "" {
+			evidenceThreadID = c.threadID
+		}
+		c.controlEvidence.publish(TerminalEvidence{
+			ThreadID: evidenceThreadID,
+			TurnID:   turnID,
+			Status:   status,
+			Kind:     codexTerminalKind(status, aborted),
+		})
 
 		// Capture the error message from failed turns so callers can surface
 		// a real reason instead of falling back to "empty output".

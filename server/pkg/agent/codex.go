@@ -839,6 +839,13 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	}
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
+	// Turn control has to follow the attempt that is actually running. A retry
+	// abandons the previous attempt's process entirely, so a control handle
+	// pinned to firstSession would steer or interrupt a turn that no longer
+	// exists. The holder is atomic because the goroutine swapping attempts is
+	// not the goroutine controlling the turn.
+	activeSession := &atomic.Pointer[Session]{}
+	activeSession.Store(firstSession)
 
 	go func() {
 		defer close(msgCh)
@@ -853,6 +860,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 					resCh <- Result{Status: "failed", Error: err.Error()}
 					return
 				}
+				activeSession.Store(session)
 			}
 			// Hold back the leading session-pin status messages until this
 			// attempt proves it made real progress. A retry never continues the
@@ -930,7 +938,13 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh}, nil
+	return &Session{
+		Messages: msgCh,
+		Result:   resCh,
+		turnControl: func(ctx context.Context, req TurnControlRequest) (TurnControlResult, error) {
+			return activeSession.Load().ControlTurn(ctx, req)
+		},
+	}, nil
 }
 
 func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts ExecOptions, attempt int) (*Session, error) {
@@ -1440,7 +1454,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			}
 			return
 		}
-		c.threadID = threadID
+		c.setThreadID(threadID)
 		if resumed {
 			b.cfg.Logger.Info("codex thread resumed", "thread_id", threadID)
 		} else {
@@ -1759,7 +1773,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh}, nil
+	return &Session{Messages: msgCh, Result: resCh, turnControl: c.controlTurn}, nil
 }
 
 // The continuity notice this backend prepends is supplied by the caller via
@@ -2138,6 +2152,7 @@ func describeCodexSemanticActivity(msg Message) string {
 type codexClient struct {
 	cfg                Config
 	stdin              interface{ Write([]byte) (int, error) }
+	writeMu            sync.Mutex // serialises stdin.Write calls across goroutines
 	mu                 sync.Mutex
 	nextID             int
 	pending            map[int]*pendingRPC
@@ -2151,6 +2166,14 @@ type codexClient struct {
 	threadStartStarted time.Time
 	threadID           string
 	turnID             string
+	// controlThreadID and controlTurnID mirror threadID/turnID for the
+	// turn-control path. The originals are written by the lifecycle and stdout
+	// reader goroutines without a lock, which is safe only because those same
+	// goroutines are their only readers. Turn control is driven by an unrelated
+	// caller goroutine, so it reads these instead of retrofitting a lock onto
+	// every existing access to the originals.
+	controlThreadID    codexAtomicString
+	controlTurnID      codexAtomicString
 	onMessage          func(Message)
 	onSemanticActivity func(description string)
 	onTurnDone         func(aborted bool)
@@ -2303,6 +2326,16 @@ func codexRequestContextError(ctx context.Context) error {
 	return ctx.Err()
 }
 
+// writeLine serialises concurrent JSON-RPC writes so the lifecycle goroutine
+// (request), the stdout reader goroutine (respond/respondError) and a
+// turn-control caller don't interleave frames on stdin. Mirrors
+// hermesClient.writeLine.
+func (c *codexClient) writeLine(data []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.stdin.Write(data)
+}
+
 func (c *codexClient) request(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -2345,7 +2378,7 @@ func (c *codexClient) request(ctx context.Context, method string, params any) (j
 		return nil, err
 	}
 	data = append(data, '\n')
-	if _, err := c.stdin.Write(data); err != nil {
+	if _, err := c.writeLine(data); err != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
@@ -2394,7 +2427,7 @@ func (c *codexClient) notify(method string) {
 	}
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
-	_, _ = c.stdin.Write(data)
+	_, _ = c.writeLine(data)
 }
 
 func (c *codexClient) respond(id int, result any) {
@@ -2405,7 +2438,7 @@ func (c *codexClient) respond(id int, result any) {
 	}
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
-	_, _ = c.stdin.Write(data)
+	_, _ = c.writeLine(data)
 }
 
 func (c *codexClient) respondError(id int, code int, message string) {
@@ -2419,7 +2452,7 @@ func (c *codexClient) respondError(id int, code int, message string) {
 	}
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
-	_, _ = c.stdin.Write(data)
+	_, _ = c.writeLine(data)
 }
 
 func (c *codexClient) closeAllPending(err error) {
@@ -3113,7 +3146,7 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 	case "turn/started":
 		c.turnStarted = true
 		if turnID := extractNestedString(params, "turn", "id"); turnID != "" {
-			c.turnID = turnID
+			c.setTurnID(turnID)
 		}
 		if c.onMessage != nil {
 			c.onMessage(Message{Type: MessageStatus, Status: "running", SessionID: c.threadID})

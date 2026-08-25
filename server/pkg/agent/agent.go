@@ -8,6 +8,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -133,13 +134,85 @@ func runContext(ctx context.Context, timeout time.Duration) (context.Context, co
 	return context.WithCancel(ctx)
 }
 
+// ControlOperation is a provider-neutral request to cooperatively steer an active session.
+type ControlOperation string
+
+const (
+	ControlCheckpoint        ControlOperation = "checkpoint"
+	ControlCancelAndRedirect ControlOperation = "cancel_and_redirect"
+	ControlInterrupt         ControlOperation = "interrupt"
+)
+
+var (
+	ErrControlUnsupported = errors.New("agent session control is unsupported")
+	ErrControlInactive    = errors.New("agent session is not active")
+)
+
+// ControlRequest is deliberately provider-neutral. RequestID is the caller's
+// stable idempotency key; provider identity fields prevent cross-session writes.
+type ControlRequest struct {
+	RequestID                 string
+	Operation                 ControlOperation
+	Instruction               string
+	ExpectedProviderSessionID string
+	ExpectedProviderTurnID    string
+}
+
+// ControlResult records only provider-confirmed control outcomes. Accepted is
+// never inferred from context cancellation, signals, or process termination.
+type ControlResult struct {
+	Provider          string
+	ProviderSessionID string
+	ProviderTurnID    string
+	Accepted          bool
+	BoundaryKind      string
+	TerminalEvidence  string
+	ResumableEvidence string
+	Timestamp         time.Time
+}
+
+// validateControlRequest rejects malformed work before it can reach a provider.
+func validateControlRequest(request ControlRequest) error {
+	if strings.TrimSpace(request.RequestID) == "" {
+		return fmt.Errorf("control request id is required")
+	}
+	switch request.Operation {
+	case ControlCheckpoint, ControlCancelAndRedirect:
+		if strings.TrimSpace(request.Instruction) == "" {
+			return fmt.Errorf("control instruction is required for %s", request.Operation)
+		}
+	case ControlInterrupt:
+	default:
+		return fmt.Errorf("unknown control operation %q", request.Operation)
+	}
+	return nil
+}
+
+type sessionControlFunc func(context.Context, ControlRequest) (ControlResult, error)
+
 // Session represents a running agent execution.
 type Session struct {
 	// Messages streams events as the agent works. The channel is closed
 	// when the agent finishes (before Result is sent).
 	Messages <-chan Message
 	// Result receives exactly one value — the final outcome — then closes.
-	Result <-chan Result
+	Result  <-chan Result
+	control sessionControlFunc
+}
+
+// Control delegates to the active provider transport. Unsupported providers do
+// no I/O; validation happens before the provider handler is called.
+func (s *Session) Control(ctx context.Context, request ControlRequest) (ControlResult, error) {
+	if err := validateControlRequest(request); err != nil {
+		return ControlResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return ControlResult{}, err
+	}
+	if s == nil || s.control == nil {
+		return ControlResult{}, ErrControlUnsupported
+	}
+	return s.control(ctx, request)
 }
 
 // MessageType identifies the kind of Message.

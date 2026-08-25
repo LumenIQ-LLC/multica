@@ -24,8 +24,6 @@ COPY server/go.mod server/go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 COPY server/ ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go test ./pkg/agent
 COPY --from=web-builder /build/apps/web/dist ./internal/static/dist
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \

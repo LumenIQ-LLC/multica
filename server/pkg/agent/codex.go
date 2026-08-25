@@ -930,7 +930,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh, control: firstSession.control}, nil
+	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
 func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts ExecOptions, attempt int) (*Session, error) {
@@ -1112,8 +1112,6 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		cfg:                  b.cfg,
 		stdin:                stdin,
 		pending:              make(map[int]*pendingRPC),
-		controlResults:       make(map[string]ControlResult),
-		completedEvents:      make(chan codexCompletedEvent, 16),
 		processDone:          make(chan struct{}),
 		handshakeTimeout:     handshakeTimeout,
 		pid:                  cmd.Process.Pid,
@@ -1761,7 +1759,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh, control: c.control}, nil
+	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
 // The continuity notice this backend prepends is supplied by the caller via
@@ -2137,20 +2135,10 @@ func describeCodexSemanticActivity(msg Message) string {
 
 // ── codexClient: JSON-RPC 2.0 transport ──
 
-type codexCompletedEvent struct {
-	threadID string
-	turnID   string
-	status   string
-}
-
 type codexClient struct {
 	cfg                Config
 	stdin              interface{ Write([]byte) (int, error) }
 	mu                 sync.Mutex
-	writeMu            sync.Mutex // serializes JSON-RPC stdin frames
-	controlMu          sync.Mutex // serializes/idempotently caches cooperative controls
-	controlResults     map[string]ControlResult
-	completedEvents    chan codexCompletedEvent
 	nextID             int
 	pending            map[int]*pendingRPC
 	processDone        chan struct{}
@@ -2357,11 +2345,7 @@ func (c *codexClient) request(ctx context.Context, method string, params any) (j
 		return nil, err
 	}
 	data = append(data, '\n')
-	c.writeMu.Lock()
-	_, writeErr := c.stdin.Write(data)
-	c.writeMu.Unlock()
-	if writeErr != nil {
-		err := writeErr
+	if _, err := c.stdin.Write(data); err != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
@@ -2436,51 +2420,6 @@ func (c *codexClient) respondError(id int, code int, message string) {
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
 	_, _ = c.stdin.Write(data)
-}
-
-// control sends one provider-native cooperative control and only accepts it after
-// the app-server confirms the correlated turn/completed boundary.
-func (c *codexClient) control(ctx context.Context, request ControlRequest) (ControlResult, error) {
-	c.controlMu.Lock()
-	defer c.controlMu.Unlock()
-	if result, ok := c.controlResults[request.RequestID]; ok {
-		return result, nil
-	}
-	c.mu.Lock()
-	threadID, turnID, dead := c.threadID, c.turnID, c.processErr
-	c.mu.Unlock()
-	if dead != nil || threadID == "" || turnID == "" {
-		return ControlResult{}, ErrControlInactive
-	}
-	if request.ExpectedProviderSessionID != "" && request.ExpectedProviderSessionID != threadID {
-		return ControlResult{}, ErrControlInactive
-	}
-	if request.ExpectedProviderTurnID != "" && request.ExpectedProviderTurnID != turnID {
-		return ControlResult{}, ErrControlInactive
-	}
-	method, params := "turn/interrupt", map[string]any{"threadId": threadID, "turnId": turnID}
-	if request.Operation == ControlCheckpoint || request.Operation == ControlCancelAndRedirect {
-		method = "turn/steer"
-		params["input"] = request.Instruction
-	}
-	if _, err := c.request(ctx, method, params); err != nil {
-		return ControlResult{}, err
-	}
-	for {
-		select {
-		case event := <-c.completedEvents:
-			if event.threadID != threadID || event.turnID != turnID {
-				continue
-			}
-			result := ControlResult{Provider: "codex", ProviderSessionID: threadID, ProviderTurnID: turnID, Accepted: true, BoundaryKind: "turn/completed", TerminalEvidence: "turn/completed:" + event.status, ResumableEvidence: "codex thread remains addressable", Timestamp: time.Now().UTC()}
-			c.controlResults[request.RequestID] = result
-			return result, nil
-		case <-ctx.Done():
-			return ControlResult{}, ctx.Err()
-		case <-c.processDone:
-			return ControlResult{}, errCodexProcessExited
-		}
-	}
 }
 
 func (c *codexClient) closeAllPending(err error) {
@@ -3184,10 +3123,6 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 		turnID := extractNestedString(params, "turn", "id")
 		status := extractNestedString(params, "turn", "status")
 		threadID, _ := params["threadId"].(string)
-		select {
-		case c.completedEvents <- codexCompletedEvent{threadID: threadID, turnID: turnID, status: status}:
-		default:
-		}
 		c.cfg.Logger.Info("codex turn/completed received", "thread_id", threadID, "turn_id", turnID, "status", status)
 		aborted := status == "cancelled" || status == "canceled" ||
 			status == "aborted" || status == "interrupted"

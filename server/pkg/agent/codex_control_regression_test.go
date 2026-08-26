@@ -40,7 +40,7 @@ func TestCodexControlPrefersReadyEvidenceOverProcessExit(t *testing.T) {
 		}
 		c.markProcessExited(errCodexProcessExited)
 
-		ev, err := c.awaitTerminalEvidence(context.Background(), ch, "thread-1", "turn-1")
+		ev, err := c.awaitTerminalEvidence(context.Background(), ch, "thread-1", "turn-1", c.evidenceTimeout())
 		if err != nil {
 			t.Fatalf("run %d: ready correlated evidence was discarded in favour of process exit: %v", i, err)
 		}
@@ -71,7 +71,7 @@ func TestCodexControlPrefersReadyEvidenceOverCancellationAndTimeout(t *testing.T
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		for i := 0; i < 200; i++ {
-			if _, err := c.awaitTerminalEvidence(ctx, queued(), "thread-1", "turn-1"); err != nil {
+			if _, err := c.awaitTerminalEvidence(ctx, queued(), "thread-1", "turn-1", c.evidenceTimeout()); err != nil {
 				t.Fatalf("run %d: ready evidence lost to a cancelled context: %v", i, err)
 			}
 		}
@@ -83,7 +83,7 @@ func TestCodexControlPrefersReadyEvidenceOverCancellationAndTimeout(t *testing.T
 		for i := 0; i < 200; i++ {
 			ch := queued()
 			time.Sleep(time.Microsecond) // let the timer fire first
-			if _, err := c.awaitTerminalEvidence(context.Background(), ch, "thread-1", "turn-1"); err != nil {
+			if _, err := c.awaitTerminalEvidence(context.Background(), ch, "thread-1", "turn-1", c.evidenceTimeout()); err != nil {
 				t.Fatalf("run %d: ready evidence lost to an expired timer: %v", i, err)
 			}
 		}

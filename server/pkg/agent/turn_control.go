@@ -85,6 +85,19 @@ const (
 	TurnTerminalAborted TurnTerminalKind = "aborted"
 	// TurnTerminalFailed is a turn that ended in provider-reported failure.
 	TurnTerminalFailed TurnTerminalKind = "failed"
+	// TurnStillRunning is the successful outcome of a STEER: the provider
+	// accepted the additional input for this thread and turn, and that turn had
+	// not terminated when the acceptance window elapsed.
+	//
+	// It is the one kind that is not a terminal state, and it is deliberately
+	// only ever produced for steer. A steer's claim is "the input entered the
+	// live turn", not "the turn ended" — waiting for termination reports failure
+	// for a turn that is working correctly but for longer than the window, and a
+	// caller that retries on that failure injects the input twice. Interrupt,
+	// whose claim IS termination, never produces this kind.
+	//
+	// See docs/design/turn-control-effect-contract.md.
+	TurnStillRunning TurnTerminalKind = "still_running"
 )
 
 // TerminalEvidence is the provider's own proof that a specific turn on a

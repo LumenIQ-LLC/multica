@@ -2203,6 +2203,7 @@ type codexClient struct {
 
 	notificationProtocol string // "unknown", "legacy", "raw"
 	turnStarted          bool
+	startedTurnIDs       map[string]bool
 	completedTurnIDs     map[string]bool
 
 	usageMu sync.Mutex
@@ -3156,6 +3157,17 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 		c.turnStarted = true
 		if turnID := extractNestedString(params, "turn", "id"); turnID != "" {
 			c.setTurnID(turnID)
+			// Record which turns the provider actually STARTED, mirroring
+			// completedTurnIDs on the terminal side. Without this the only
+			// per-turn counter in the client is the completion map, and "did a
+			// control operation silently start a replacement turn?" — the
+			// question a steer must be able to answer — has no honest source:
+			// counting completions answers a different question and happens to
+			// agree only when exactly one turn ends.
+			if c.startedTurnIDs == nil {
+				c.startedTurnIDs = map[string]bool{}
+			}
+			c.startedTurnIDs[turnID] = true
 		}
 		if c.onMessage != nil {
 			c.onMessage(Message{Type: MessageStatus, Status: "running", SessionID: c.threadID})
@@ -3169,29 +3181,14 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 		aborted := status == "cancelled" || status == "canceled" ||
 			status == "aborted" || status == "interrupted"
 
-		// Publish terminal evidence to any in-flight turn-control call. This
-		// happens BEFORE the completedTurnIDs dedupe below: that dedupe exists
-		// to keep onTurnDone from firing twice, and letting it also swallow the
-		// evidence would starve a control caller that is legitimately waiting.
-		//
-		// threadId is absent on some app-server builds, and
-		// isNotificationFromOtherThread has already established that anything
-		// reaching here belongs to the tracked thread — so an absent id means
-		// "ours" and resolves to c.threadID rather than to empty, which would
-		// never correlate.
-		evidenceThreadID := threadID
-		if evidenceThreadID == "" {
-			evidenceThreadID = c.threadID
-		}
-		c.controlEvidence.publish(TerminalEvidence{
-			ThreadID: evidenceThreadID,
-			TurnID:   turnID,
-			Status:   status,
-			Kind:     codexTerminalKind(status, aborted),
-		})
-
 		// Capture the error message from failed turns so callers can surface
 		// a real reason instead of falling back to "empty output".
+		//
+		// This MUST run BEFORE the publish below. The publish wakes any waiting
+		// turn-control call, which reads getTurnError() to describe the
+		// failure; recording the detail afterwards is a race that degrades a
+		// real reason ("model provider returned 500") to a bare status string
+		// whenever the waiter happens to be scheduled promptly.
 		if status == "failed" {
 			errMsg := extractNestedString(params, "turn", "error", "message")
 			if errMsg == "" {
@@ -3199,6 +3196,14 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 			}
 			c.setTurnError(errMsg)
 		}
+
+		// Retire the control pointer and publish terminal evidence to any
+		// in-flight turn-control call. This happens BEFORE the completedTurnIDs
+		// dedupe below: that dedupe exists to keep onTurnDone from firing twice,
+		// and letting it also swallow the evidence would starve a control caller
+		// that is legitimately waiting. See publishControlTerminal for the
+		// retire-then-publish ordering contract.
+		c.publishControlTerminal(threadID, turnID, status, aborted)
 
 		if c.completedTurnIDs == nil {
 			c.completedTurnIDs = map[string]bool{}
@@ -3239,6 +3244,16 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 			}
 			if !willRetry {
 				c.setTurnError(errMsg)
+				// A terminal protocol error ends the turn just as surely as
+				// turn/completed does, and the app-server will send no
+				// turn/completed after it. Publishing here is what stops an
+				// in-flight steer/interrupt from waiting out the full evidence
+				// timeout and then reporting "uncorrelated" — the provider did
+				// tell us what happened. setTurnError above runs first so the
+				// woken waiter reports this message rather than a bare status.
+				// The notification carries no turn id, so the live control turn
+				// is used; aborted=false because an error is not an abort.
+				c.publishControlTerminal("", "", "error", false)
 				if c.onTurnDone != nil {
 					c.onTurnDone(false)
 				}
@@ -3248,6 +3263,19 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 	case "thread/status/changed":
 		statusType := extractNestedString(params, "status", "type")
 		if statusType == "idle" && c.turnStarted {
+			// The thread going idle after a turn started means that turn is
+			// over. In the ordinary case turn/completed already ran, retired the
+			// control pointer and published; publishControlTerminal then finds no
+			// live turn and does nothing, so this adds no duplicate evidence.
+			// It matters only for the path where the app-server ends the turn by
+			// going idle WITHOUT a turn/completed — previously the one terminal
+			// path that told a waiting control call nothing at all.
+			//
+			// "idle" is not a success status, so codexTerminalKind classifies it
+			// as a failed turn. That is the fail-closed reading this contract
+			// requires: an idle thread proves the turn stopped, never that the
+			// steer or interrupt is what stopped it.
+			c.publishControlTerminal("", "", "idle", false)
 			if c.onTurnDone != nil {
 				c.onTurnDone(false)
 			}

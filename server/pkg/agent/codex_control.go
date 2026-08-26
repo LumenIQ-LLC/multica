@@ -24,6 +24,15 @@ const codexControlEvidenceTimeout = 5 * time.Minute
 // queue holds several rather than one.
 const codexControlEvidenceBuffer = 8
 
+// codexControlRequestTimeout bounds the control RPC itself — the round trip to
+// the app-server, not the turn. turn/steer and turn/interrupt are deliberately
+// NOT in isCodexHandshakeRPC (they are not handshake calls), so without this
+// they inherit only the caller's context; a caller passing context.Background()
+// to an app-server that accepts the frame and never answers would block
+// forever, and the evidence timeout below would never get to run because the
+// wait happens after the RPC returns.
+const codexControlRequestTimeout = 30 * time.Second
+
 // codexControlEvidenceBus fans terminal turn events out to the turn-control
 // calls waiting on them. It is a broadcast rather than a single channel because
 // more than one control call can legitimately be in flight — and because the
@@ -77,10 +86,17 @@ func codexTerminalKind(status string, aborted bool) TurnTerminalKind {
 	switch {
 	case aborted:
 		return TurnTerminalAborted
-	case status == "failed":
-		return TurnTerminalFailed
-	default:
+	case status == "completed":
 		return TurnTerminalCompleted
+	default:
+		// Fail CLOSED. Only a status we recognize as success is reported as a
+		// completed turn; "failed", anything unrecognized ("error", "timeout",
+		// "incomplete", a status a future Codex adds) and an absent status all
+		// resolve to failed. The asymmetry is deliberate: a spurious "the turn
+		// failed" costs a caller a retry, whereas a spurious "completed" tells
+		// it the steer or interrupt took effect when nothing proves that — the
+		// exact failure this whole evidence contract exists to prevent.
+		return TurnTerminalFailed
 	}
 }
 
@@ -117,6 +133,24 @@ func (c *codexClient) setThreadID(id string) {
 func (c *codexClient) setTurnID(id string) {
 	c.turnID = id
 	c.controlTurnID.set(id)
+}
+
+// retireControlTurn clears the control pointer once turnID's turn has reached a
+// terminal state, so controlTurn stops accepting it as a live target.
+//
+// It deliberately clears ONLY the control mirror and leaves c.turnID intact:
+// c.turnID is still read after the turn ends to attribute diagnostics and
+// timeout reports to the turn they came from, and blanking it would degrade
+// those messages. The mirror answers a different question — "is there a turn I
+// may still steer or interrupt?" — whose honest answer here is no.
+//
+// A mismatched id is ignored so a stale or subagent terminal cannot retire the
+// pointer for a turn that is genuinely still running.
+func (c *codexClient) retireControlTurn(turnID string) {
+	if turnID == "" || c.controlTurnID.get() != turnID {
+		return
+	}
+	c.controlTurnID.set("")
 }
 
 // controlTurn performs one turn-control operation against the app-server. It is
@@ -171,7 +205,11 @@ func (c *codexClient) controlTurn(ctx context.Context, req TurnControlRequest) (
 	evidence, unsubscribe := c.controlEvidence.subscribe()
 	defer unsubscribe()
 
-	if _, err := c.request(ctx, method, params); err != nil {
+	// Bound the RPC independently of the evidence wait: an app-server that
+	// takes the frame and never replies must not hang the caller.
+	requestCtx, cancelRequest := context.WithTimeout(ctx, codexControlRequestTimeout)
+	defer cancelRequest()
+	if _, err := c.request(requestCtx, method, params); err != nil {
 		// A dead process is not a wire rejection — keep it matching
 		// errCodexProcessExited so callers that distinguish "the agent died"
 		// from "the agent said no" still can.
@@ -240,24 +278,55 @@ func (c *codexClient) awaitTerminalEvidence(
 	defer timer.Stop()
 
 	uncorrelated := 0
+
+	// classify turns one queued event into a verdict. ok=false means "not about
+	// our target, keep waiting".
+	classify := func(ev TerminalEvidence) (TerminalEvidence, error, bool) {
+		if !ev.correlates(threadID, turnID) {
+			uncorrelated++
+			return TerminalEvidence{}, nil, false
+		}
+		if ev.Kind == TurnTerminalFailed {
+			detail := c.getTurnError()
+			if detail == "" {
+				detail = ev.Status
+			}
+			return TerminalEvidence{}, fmt.Errorf("%w: thread %s turn %s: %s",
+				ErrTurnControlTurnFailed, threadID, turnID, detail), true
+		}
+		return ev, nil, true
+	}
+
+	// drain empties whatever is already queued before we honour a competing
+	// ready case. Go's select picks uniformly at random among ready cases, so
+	// without this a turn that really did terminate loses a coin flip to
+	// processDone/ctx/timer — the publisher buffers the evidence and then drives
+	// the lifecycle straight into markProcessExited, leaving both ready. This
+	// mirrors the same nested-drain guard request() already uses.
+	drain := func() (TerminalEvidence, error, bool) {
+		for {
+			select {
+			case ev := <-evidence:
+				if res, err, done := classify(ev); done {
+					return res, err, true
+				}
+			default:
+				return TerminalEvidence{}, nil, false
+			}
+		}
+	}
+
 	for {
 		select {
 		case ev := <-evidence:
-			if !ev.correlates(threadID, turnID) {
-				uncorrelated++
-				continue
+			if res, err, done := classify(ev); done {
+				return res, err
 			}
-			if ev.Kind == TurnTerminalFailed {
-				detail := c.getTurnError()
-				if detail == "" {
-					detail = ev.Status
-				}
-				return TerminalEvidence{}, fmt.Errorf("%w: thread %s turn %s: %s",
-					ErrTurnControlTurnFailed, threadID, turnID, detail)
-			}
-			return ev, nil
 
 		case <-c.processDone:
+			if res, err, done := drain(); done {
+				return res, err
+			}
 			// The process died instead of the turn terminating. Process exit —
 			// including a SIGTERM or SIGKILL that produced it — is NOT evidence
 			// that the control action took effect, so it fails closed here
@@ -271,11 +340,17 @@ func (c *codexClient) awaitTerminalEvidence(
 				ErrTurnControlUncorrelated, threadID, turnID, err)
 
 		case <-ctx.Done():
+			if res, err, done := drain(); done {
+				return res, err
+			}
 			return TerminalEvidence{}, fmt.Errorf(
 				"%w: waiting for thread %s turn %s terminal evidence: %w",
 				ErrTurnControlUncorrelated, threadID, turnID, ctx.Err())
 
 		case <-timer.C:
+			if res, err, done := drain(); done {
+				return res, err
+			}
 			return TerminalEvidence{}, fmt.Errorf(
 				"%w: no terminal event for thread %s turn %s within %s (%d unrelated terminal events seen)",
 				ErrTurnControlUncorrelated, threadID, turnID, c.evidenceTimeout(), uncorrelated)

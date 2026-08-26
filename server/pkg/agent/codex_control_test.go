@@ -330,8 +330,16 @@ func TestCodexSteerReturnsCorrelatedSameTurnTerminalEvidence(t *testing.T) {
 	if method != "turn/steer" {
 		t.Fatalf("method = %q, want turn/steer", method)
 	}
-	if got := c.controlTurnID.get(); got != "turn-1" {
-		t.Fatalf("live turn = %q after steer, want turn-1 — the turn was replaced, not steered", got)
+	// c.turnID, not the control mirror: the mirror is deliberately retired once
+	// a turn reaches a terminal state (a finished turn is not a legal control
+	// target), and this fixture's own turn/completed does exactly that. c.turnID
+	// is what still names the last turn the provider started, so it is the field
+	// that actually answers "was a replacement turn issued?".
+	if got := c.turnID; got != "turn-1" {
+		t.Fatalf("last started turn = %q after steer, want turn-1 — the turn was replaced, not steered", got)
+	}
+	if got := c.controlTurnID.get(); got != "" {
+		t.Fatalf("control mirror = %q after the turn terminated, want empty — a finished turn must not stay a control target", got)
 	}
 	if n := countStarts(c); n != 1 {
 		t.Fatalf("%d turns terminated, want exactly 1 — a replacement turn was issued", n)

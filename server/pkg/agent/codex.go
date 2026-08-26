@@ -3169,11 +3169,6 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 		aborted := status == "cancelled" || status == "canceled" ||
 			status == "aborted" || status == "interrupted"
 
-		// Publish terminal evidence to any in-flight turn-control call. This
-		// happens BEFORE the completedTurnIDs dedupe below: that dedupe exists
-		// to keep onTurnDone from firing twice, and letting it also swallow the
-		// evidence would starve a control caller that is legitimately waiting.
-		//
 		// threadId is absent on some app-server builds, and
 		// isNotificationFromOtherThread has already established that anything
 		// reaching here belongs to the tracked thread — so an absent id means
@@ -3183,15 +3178,15 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 		if evidenceThreadID == "" {
 			evidenceThreadID = c.threadID
 		}
-		c.controlEvidence.publish(TerminalEvidence{
-			ThreadID: evidenceThreadID,
-			TurnID:   turnID,
-			Status:   status,
-			Kind:     codexTerminalKind(status, aborted),
-		})
 
 		// Capture the error message from failed turns so callers can surface
 		// a real reason instead of falling back to "empty output".
+		//
+		// This MUST run BEFORE the publish below. The publish wakes any waiting
+		// turn-control call, which reads getTurnError() to describe the
+		// failure; recording the detail afterwards is a race that degrades a
+		// real reason ("model provider returned 500") to a bare status string
+		// whenever the waiter happens to be scheduled promptly.
 		if status == "failed" {
 			errMsg := extractNestedString(params, "turn", "error", "message")
 			if errMsg == "" {
@@ -3199,6 +3194,24 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 			}
 			c.setTurnError(errMsg)
 		}
+
+		// This turn is over, so it is no longer a legitimate control target.
+		// Retiring the pointer before publishing is what makes a LATER control
+		// call return ErrTurnControlInactive instead of sending an interrupt to
+		// a finished turn and then waiting out the evidence timeout for an
+		// event that already fired.
+		c.retireControlTurn(turnID)
+
+		// Publish terminal evidence to any in-flight turn-control call. This
+		// happens BEFORE the completedTurnIDs dedupe below: that dedupe exists
+		// to keep onTurnDone from firing twice, and letting it also swallow the
+		// evidence would starve a control caller that is legitimately waiting.
+		c.controlEvidence.publish(TerminalEvidence{
+			ThreadID: evidenceThreadID,
+			TurnID:   turnID,
+			Status:   status,
+			Kind:     codexTerminalKind(status, aborted),
+		})
 
 		if c.completedTurnIDs == nil {
 			c.completedTurnIDs = map[string]bool{}

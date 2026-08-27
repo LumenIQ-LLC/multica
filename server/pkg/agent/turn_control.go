@@ -163,6 +163,12 @@ func (r TurnControlRequest) validate() error {
 	return nil
 }
 
+// Terminal classification is FAIL-CLOSED: only a status a provider states as
+// success is reported as a completed turn. A live codex-cli 0.150.0
+// app-server was probed to confirm turn/completed carries an explicit status
+// ("completed", alongside id/items/error/startedAt/completedAt/durationMs),
+// so that default costs nothing on the ordinary path.
+//
 // TurnControlResult reports what the provider actually acted on. It records the
 // provider's own identifiers so a caller correlating against a transcript can
 // tell which conversation and turn were touched.

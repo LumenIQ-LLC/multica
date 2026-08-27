@@ -1019,10 +1019,11 @@ func TestCodexControlGetsEvidenceFromEveryTerminalPath(t *testing.T) {
 			"error_notification_terminal",
 			`{"jsonrpc":"2.0","method":"error","params":{"willRetry":false,"error":{"message":"model provider returned 500"}}}`,
 		},
-		{
-			"thread_status_changed_idle",
-			`{"jsonrpc":"2.0","method":"thread/status/changed","params":{"status":{"type":"idle"}}}`,
-		},
+		// thread/status/changed -> idle is deliberately NOT in this list. On a
+		// live codex-cli 0.150.0 app-server it arrives BEFORE the turn/completed
+		// that carries the real verdict, so treating it as terminal evidence
+		// preempted every successful turn. It is a thread status, not a turn
+		// verdict. See codex_control_idle_order_test.go.
 	}
 	ops := []struct {
 		name string

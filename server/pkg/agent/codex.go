@@ -3263,19 +3263,29 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 	case "thread/status/changed":
 		statusType := extractNestedString(params, "status", "type")
 		if statusType == "idle" && c.turnStarted {
-			// The thread going idle after a turn started means that turn is
-			// over. In the ordinary case turn/completed already ran, retired the
-			// control pointer and published; publishControlTerminal then finds no
-			// live turn and does nothing, so this adds no duplicate evidence.
-			// It matters only for the path where the app-server ends the turn by
-			// going idle WITHOUT a turn/completed — previously the one terminal
-			// path that told a waiting control call nothing at all.
+			// Deliberately does NOT publish control terminal evidence.
 			//
-			// "idle" is not a success status, so codexTerminalKind classifies it
-			// as a failed turn. That is the fail-closed reading this contract
-			// requires: an idle thread proves the turn stopped, never that the
-			// steer or interrupt is what stopped it.
-			c.publishControlTerminal("", "", "idle", false)
+			// An earlier version did, on the assumption that turn/completed runs
+			// first in the ordinary case and leaves nothing for idle to do.
+			// Probing a live codex-cli 0.150.0 app-server shows the opposite:
+			// idle arrives BEFORE turn/completed on an ordinary successful turn,
+			// in the same millisecond.
+			//
+			//   turn/started
+			//   thread/status/changed -> idle       <- first
+			//   turn/completed status="completed"   <- second
+			//
+			// Publishing here therefore won the race on EVERY successful turn:
+			// "idle" is not a success status, so it classified as a failed turn
+			// and woke the waiter with that verdict before the real terminal
+			// arrived — an interrupt of a turn that completed perfectly reported
+			// failure. See TestCodexControlIdleDoesNotPreemptCompleted.
+			//
+			// The terminal paths that genuinely carry no turn/completed after
+			// them (a top-level error with willRetry=false) publish from their
+			// own handlers, where the notification really is the last word. idle
+			// is a THREAD status, not a turn verdict, and on this protocol it
+			// cannot be read as one.
 			if c.onTurnDone != nil {
 				c.onTurnDone(false)
 			}

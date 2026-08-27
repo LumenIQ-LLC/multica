@@ -29,6 +29,7 @@ jobs:
       frontend: ${{ steps.decide.outputs.frontend }}
       backend: ${{ steps.decide.outputs.backend }}
       sqlc: ${{ steps.decide.outputs.sqlc }}
+      installer: ${{ steps.decide.outputs.installer }}
       images: ${{ steps.filter.outputs.images }}
     steps:
       - name: Checkout
@@ -131,23 +132,41 @@ jobs:
               - '**/*.webp'
               - '**/*.avif'
               - 'scripts/check-image-budget.mjs'
+            # Gates the installer matrix. It runs on three platforms, and the
+            # macOS leg bills at 10x, so a change that cannot affect either
+            # installer must not pay for it. Both installers plus their own
+            # test suites are listed; the selfhost port-contract test that also
+            # reads install.sh lives in the frontend filter above and is
+            # unaffected by this gate.
+            installer:
+              - 'scripts/install.sh'
+              - 'scripts/install.ps1'
+              - 'scripts/install.test.sh'
+              - 'scripts/install.ps1.test.ps1'
+              - '.github/workflows/ci.yml'
 
       - name: Decide
         id: decide
         # Always run everything on push to main (full validation); on
         # pull_request, run only the areas whose paths changed.
-        # The gated jobs themselves always run and report success — their
-        # steps are gated on these outputs rather than the job being skipped
-        # — so the required "frontend" / "backend" status checks are
-        # satisfied with a genuine green instead of being left pending on
-        # filtered PRs. It also keeps the aggregate gates strict: a job that
-        # goes missing for any OTHER reason (a failed `changes`, a cancelled
-        # run) still reports non-success and fails the gate.
+        #
+        # LEAF jobs are gated at the JOB level on these outputs, so a leaf with
+        # nothing to do is skipped outright rather than booting a runner to
+        # execute no steps — GitHub bills a full minute per job regardless of
+        # how little it does.
+        #
+        # The "frontend" and "backend" AGGREGATE jobs are deliberately NOT
+        # gated; see the comments on those jobs. They always run, and they
+        # treat a skipped leaf as satisfied while still failing on any other
+        # non-success. That keeps the gates strict: a leaf that goes missing
+        # for some OTHER reason (a failed `changes`, a cancelled run) reports
+        # neither success nor skipped, and fails the gate.
         env:
           EVENT_NAME: ${{ github.event_name }}
           FRONTEND_CHANGED: ${{ steps.filter.outputs.frontend }}
           BACKEND_CHANGED: ${{ steps.filter.outputs.backend }}
           SQLC_CHANGED: ${{ steps.filter.outputs.sqlc }}
+          INSTALLER_CHANGED: ${{ steps.filter.outputs.installer }}
         run: |
           if [ "$EVENT_NAME" != "pull_request" ] || [ "$FRONTEND_CHANGED" = "true" ]; then
             echo "frontend=true" >> "$GITHUB_OUTPUT"
@@ -164,9 +183,17 @@ jobs:
           else
             echo "sqlc=false" >> "$GITHUB_OUTPUT"
           fi
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$INSTALLER_CHANGED" = "true" ]; then
+            echo "installer=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "installer=false" >> "$GITHUB_OUTPUT"
+          fi
 
   sqlc-check:
     needs: changes
+    # Leaf job: safe to skip. The `backend` aggregate below always runs and
+    # treats a skipped leaf as satisfied.
+    if: ${{ needs.changes.outputs.sqlc == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -202,6 +229,9 @@ jobs:
   # increases total runner-minutes but reduces wall-clock feedback time.
   frontend-build:
     needs: changes
+    # Leaf job: safe to skip. The `frontend` aggregate below always runs and
+    # treats a skipped leaf as satisfied.
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
     runs-on: ubuntu-latest
     env:
       # Pin turbo's filesystem cache somewhere actions/cache can address.
@@ -313,6 +343,8 @@ jobs:
 
   frontend-test:
     needs: changes
+    # Leaf job: safe to skip (see frontend-build).
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
     runs-on: ubuntu-latest
     env:
       TURBO_CACHE_DIR: .turbo/cache
@@ -367,6 +399,9 @@ jobs:
   frontend-views-test:
     name: frontend-views-test (${{ matrix.index }}/${{ matrix.total }})
     needs: changes
+    # Leaf job: safe to skip (see frontend-build). Two shards, so gating at the
+    # job level saves two billed minutes rather than one.
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -426,6 +461,21 @@ jobs:
   # It also inherits the old contract that the check goes green (rather than
   # staying pending) on PRs the path filter excluded — all workers succeed
   # trivially in that case because every step is gated off.
+  # ############################################################################
+  # DO NOT GATE THIS JOB. DO NOT ADD A PATH FILTER. DO NOT MAKE IT CONDITIONAL.
+  #
+  # "backend" and "frontend" are REQUIRED status checks in the `main-protection`
+  # ruleset (repos/LumenIQ-LLC/multica/rulesets/21490848, enforcement: active,
+  # bypass_actors: []). GitHub does NOT count a SKIPPED required check as
+  # satisfied. If this job ever skips, every PR blocks permanently and nobody
+  # can override it — the ruleset has no bypass actors.
+  #
+  # Note the classic endpoint (/branches/main/protection) returns 404 on this
+  # repo because the protection is a RULESET, not classic branch protection.
+  # A 404 there is NOT evidence that main is unprotected.
+  #
+  # Leaf jobs may skip freely; that is what this job absorbs below.
+  # ############################################################################
   frontend:
     needs: [frontend-build, frontend-test, frontend-views-test]
     # `!cancelled()` rather than `always()`: a run superseded by a newer push
@@ -443,13 +493,27 @@ jobs:
           echo "frontend-build: $BUILD_RESULT"
           echo "frontend-test:  $TEST_RESULT"
           echo "frontend-views-test: $VIEWS_TEST_RESULT"
-          if [ "$BUILD_RESULT" != "success" ] || [ "$TEST_RESULT" != "success" ] || [ "$VIEWS_TEST_RESULT" != "success" ]; then
-            echo "::error::frontend validation failed"
-            exit 1
-          fi
+          # A leaf is satisfied when it succeeded, or when it was SKIPPED
+          # because the path filter proved it had nothing to do. Anything else
+          # — failure, cancelled, or an empty result because the leaf never
+          # reported — fails this gate.
+          for pair in "frontend-build:$BUILD_RESULT" "frontend-test:$TEST_RESULT" "frontend-views-test:$VIEWS_TEST_RESULT"; do
+            name="${pair%%:*}"
+            result="${pair#*:}"
+            case "$result" in
+              success|skipped) ;;
+              *)
+                echo "::error::frontend validation failed: $name reported '$result'"
+                exit 1
+                ;;
+            esac
+          done
 
   backend-tests:
     needs: changes
+    # Leaf job: safe to skip. The `backend` aggregate below always runs and
+    # treats a skipped leaf as satisfied.
+    if: ${{ needs.changes.outputs.backend == 'true' }}
     runs-on: ubuntu-latest
     # `services` cannot be conditional, so the Postgres and Redis containers
     # still start on a filtered PR. That is ~1 minute of runner time against
@@ -538,6 +602,8 @@ jobs:
   # The aggregate backend job below still treats both jobs as one merge gate.
   go-vulnerability-scan:
     needs: changes
+    # Leaf job: safe to skip (see backend-tests).
+    if: ${{ needs.changes.outputs.backend == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -561,6 +627,21 @@ jobs:
 
   # Preserve the existing required-check name while allowing tests, generated
   # SQL verification, and the vulnerability scan to run independently.
+  # ############################################################################
+  # DO NOT GATE THIS JOB. DO NOT ADD A PATH FILTER. DO NOT MAKE IT CONDITIONAL.
+  #
+  # "backend" and "frontend" are REQUIRED status checks in the `main-protection`
+  # ruleset (repos/LumenIQ-LLC/multica/rulesets/21490848, enforcement: active,
+  # bypass_actors: []). GitHub does NOT count a SKIPPED required check as
+  # satisfied. If this job ever skips, every PR blocks permanently and nobody
+  # can override it — the ruleset has no bypass actors.
+  #
+  # Note the classic endpoint (/branches/main/protection) returns 404 on this
+  # repo because the protection is a RULESET, not classic branch protection.
+  # A 404 there is NOT evidence that main is unprotected.
+  #
+  # Leaf jobs may skip freely; that is what this job absorbs below.
+  # ############################################################################
   backend:
     needs: [backend-tests, sqlc-check, go-vulnerability-scan]
     if: ${{ !cancelled() }}
@@ -575,10 +656,19 @@ jobs:
           echo "backend-tests:        $TEST_RESULT"
           echo "sqlc-check:           $SQLC_RESULT"
           echo "go-vulnerability-scan: $VULNERABILITY_RESULT"
-          if [ "$TEST_RESULT" != "success" ] || [ "$SQLC_RESULT" != "success" ] || [ "$VULNERABILITY_RESULT" != "success" ]; then
-            echo "::error::backend validation failed"
-            exit 1
-          fi
+          # See the frontend gate: success or skipped is satisfied, everything
+          # else fails.
+          for pair in "backend-tests:$TEST_RESULT" "sqlc-check:$SQLC_RESULT" "go-vulnerability-scan:$VULNERABILITY_RESULT"; do
+            name="${pair%%:*}"
+            result="${pair#*:}"
+            case "$result" in
+              success|skipped) ;;
+              *)
+                echo "::error::backend validation failed: $name reported '$result'"
+                exit 1
+                ;;
+            esac
+          done
 
   windows-execenv:
     # The environment-preparation deadline owns a process tree, not just a Go
@@ -588,6 +678,9 @@ jobs:
     # filter as the backend jobs; steps are gated rather than the job so the
     # check still reports green on a filtered PR.
     needs: changes
+    # Leaf job, and a 2x-billed runner: skipping outright matters here.
+    # Not an aggregate dependency, so nothing downstream needs it to report.
+    if: ${{ needs.changes.outputs.backend == 'true' }}
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -780,6 +873,12 @@ jobs:
     # userlands. Windows runs the PowerShell installer's own suite: the two
     # installers share one port contract, and neither is covered by the
     # frontend job.
+    #
+    # Path-gated: this matrix bills ubuntu 1x + windows 2x + macOS 10x, so a
+    # change that cannot touch either installer must not pay 13 billed minutes
+    # for it. Not an aggregate dependency, so skipping it blocks nothing.
+    needs: changes
+    if: ${{ needs.changes.outputs.installer == 'true' }}
     strategy:
       fail-fast: false
       matrix:

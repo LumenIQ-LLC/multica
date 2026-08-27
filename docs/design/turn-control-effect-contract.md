@@ -84,3 +84,64 @@ interrupt keeps the fail-closed assertion; steer now asserts the
 foreign turn's or thread's terminal and asserted "the call failed" now assert
 the stronger and still-correct thing: **the foreign evidence was not credited**
 — the returned evidence names our thread and our turn.
+
+## Provider convergence (G6)
+
+The contract above is now implemented **once** and shared by every backend that
+supports turn control, rather than per provider. `turn_control_evidence.go`
+owns the evidence bus, the correlated-terminal waiter, the steer acceptance
+window and the fail-closed reasoning; a backend joins by implementing
+`controlHost` — four questions, none of them provider-shaped: is the process
+done, why did it exit, what did the provider say about the failure, and which
+turn is live right now. Codex and Claude Code both run that same code, so a
+caller holding a `Session` cannot tell which backend it is steering except by
+asking `SupportsTurnControl()`. That is what makes "one abstraction over many
+providers" a property of the code rather than a claim in a README.
+
+**Identical across providers.** The neutral surface (`SupportsTurnControl` /
+`ControlTurn` / `SteerTurn` / `InterruptTurn`); request validation and its typed
+errors; the rule that an acknowledgement is never success; correlated
+`TerminalEvidence` on every terminal path; interrupt resolving only on a
+correlated terminal while steer resolves on acceptance with a checked-live turn;
+fail-closed classification of any unrecognized terminal; refusal of a stale turn
+id before any wire traffic; and process death never counting as evidence that a
+control action worked. A cross-provider conformance suite
+(`turn_control_providers_test.go`) asserts each of these against **both**
+backends through the neutral interface, and the assertions never name a wire.
+
+**Provider-specific, and deliberately so.** Only the wire and the terminal
+vocabulary:
+
+| | Codex (app-server) | Claude Code (stream-json) |
+|---|---|---|
+| interrupt | `turn/interrupt` JSON-RPC, `turnId` | `control_request` frame, `subtype: "interrupt"`, correlated by `request_id` |
+| steer | `turn/steer` JSON-RPC, `expectedTurnId` (rejects `turnId`) | an ordinary `user` frame — **no acknowledgement exists** |
+| turn identity | `threadId` + `turnId`; many turns per thread | `session_id` only; one turn per invocation, so session id *is* the turn id |
+| terminal frame | `turn/completed` with `status` | `result` with `terminal_reason` + `is_error` |
+| success reason | `status == "completed"` | `terminal_reason == "completed"` and `is_error == false` |
+
+Two provider facts are load-bearing and were established by probing live CLIs,
+not by reading fixtures — the same discipline that caught the Codex `idle`
+ordering bug that ten green CI jobs missed:
+
+- **Claude reports `is_error: true` on a *successful* interrupt**, alongside
+  `terminal_reason: "aborted_streaming"`. `terminal_reason` therefore outranks
+  `is_error`; classifying on the error flag alone would report every successful
+  interrupt as a failed turn. Mutation-tested.
+- **Claude emits `user: "[Request interrupted by user]"` *before* the `result`
+  frame.** Only `result` publishes terminal evidence. Treating that earlier
+  frame as terminal would preempt the real verdict — structurally the same bug
+  as `thread/status/changed → idle` on the Codex side (#8). Mutation-tested.
+
+Steer's missing acknowledgement is the sharpest asymmetry, and it is the reason
+the acceptance-window design generalises well: on Codex a steer is an RPC that
+*could* have been treated as proof, and the contract deliberately refuses to;
+on Claude there is no ack to be tempted by, so "the turn is still verifiably
+live" is the only available evidence — which is exactly what
+`TurnStillRunning` already meant.
+
+**Not yet converged.** Turn control still has no caller (G4, deferred on
+purpose): the capability is present on both providers, but nothing in the
+product steers or interrupts a turn yet. And only these two backends implement
+it; the remaining backends return `ErrTurnControlUnsupported`, which is a
+capability answer rather than a gap to be filled before shipping.

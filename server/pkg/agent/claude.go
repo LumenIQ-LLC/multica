@@ -112,6 +112,11 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	}
 	var closeStdinOnce sync.Once
 	closeStdin := func() { closeStdinOnce.Do(func() { _ = stdin.Close() }) }
+	// Turn control rides the same duplex stdin the prompt goes down: an
+	// interrupt is a control_request, a steer is an ordinary user frame. See
+	// claude_control.go.
+	control := newClaudeControlState(b.cfg.Logger)
+	control.attachStdin(stdin)
 	// Capture stderr into both the daemon log (as before) and a bounded tail
 	// buffer so we can include the last few KB in Result.Error when claude
 	// exits unexpectedly. Without the tail, an exit-code-only failure looks
@@ -247,6 +252,9 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			case "system":
 				if msg.SessionID != "" {
 					sessionID = msg.SessionID
+					// One Claude invocation is exactly one turn, so the session
+					// id IS the turn id for control purposes.
+					control.beginTurn(msg.SessionID)
 				}
 				trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 			case "result":
@@ -254,10 +262,25 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				finalResultText = msg.ResultText
 				resultIsError = msg.IsError
 				terminalReasonError = claudeTerminalReasonFailure(msg.TerminalReason, msg.ResultText)
-				sessionID = msg.SessionID
+				if msg.SessionID != "" {
+					sessionID = msg.SessionID
+				}
 				if resultUsage := claudeResultUsage(msg, opts.Model); len(resultUsage) > 0 {
 					usage = resultUsage
 				}
+				// Record the failure detail BEFORE publishing: the publish wakes
+				// any waiting control call, which reads the detail to describe
+				// ErrTurnControlTurnFailed. Recording afterwards is a race that
+				// degrades a real reason to a bare status string.
+				if terminalReasonError != "" {
+					control.setFailureDetail(terminalReasonError)
+				} else if resultIsError && msg.ResultText != "" {
+					control.setFailureDetail(msg.ResultText)
+				}
+				// ONLY the result frame is terminal. The `user` frame carrying
+				// "[Request interrupted by user]" arrives BEFORE this on an
+				// interrupt; publishing there would preempt the real verdict.
+				control.publishTerminal(msg.TerminalReason, msg.IsError)
 				closeStdin()
 			case "log":
 				if msg.Log != nil {
@@ -269,6 +292,11 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				}
 			case "control_request":
 				b.handleControlRequest(msg, stdin)
+			case "control_response":
+				// Answers to OUR outbound control_requests (interrupt). Inbound
+				// tool-permission traffic is the other direction and is handled
+				// above; unmatched request ids are ignored by the router.
+				control.handleControlResponse(json.RawMessage(line))
 			}
 		}
 		scanErr := scanner.Err()
@@ -283,6 +311,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 		// Wait for process exit, then release the cancellation handler.
 		exitErr := cmd.Wait()
+		control.markProcessExited(errAgentProcessExited)
 		close(procDone)
 		duration := time.Since(startTime)
 		// writeDone is buffered (cap 1) and the writer always sends — by the
@@ -363,7 +392,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh}, nil
+	return &Session{Messages: msgCh, Result: resCh, turnControl: control.controlTurn}, nil
 }
 
 func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message, usage map[string]TokenUsage) assistantTurn {

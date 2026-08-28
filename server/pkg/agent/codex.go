@@ -495,6 +495,33 @@ var userCodexMcpServersTableHeaderRe = regexp.MustCompile(
 // A malformed mcp_config is returned as an error and the caller decides
 // whether to surface or warn — same fail-soft contract the prior argv
 // path had.
+// resolveCodexHome returns the CODEX_HOME this backend should anchor its
+// per-task Codex state to, preferring the daemon's configured Env and falling
+// back to the PROCESS environment.
+//
+// The fallback is the fix for a real production failure. An embedder that sets
+// CODEX_HOME with os.Setenv and via a container ENV -- so it is unambiguously
+// present in os.Environ() -- still got:
+//
+//	codex: mcp_config is set but CODEX_HOME env var is not configured
+//
+// because the guard consulted only cfg.Env, which that embedder never
+// populates. The value was right there in the process the whole time. A guard
+// that refuses on the absence of a value it never looked for reports a
+// configuration error that does not exist, and sends whoever reads it hunting
+// through their own config for a setting they had already made.
+//
+// cfg.Env still WINS when set: the daemon giving each task an isolated
+// CODEX_HOME is the whole point of the per-task config (MUL-4424), and an
+// inherited process value must never silently override that isolation. The
+// fallback only fills a gap, it never takes precedence.
+func (b *codexBackend) resolveCodexHome() string {
+	if configured := strings.TrimSpace(b.cfg.Env["CODEX_HOME"]); configured != "" {
+		return configured
+	}
+	return strings.TrimSpace(os.Getenv("CODEX_HOME"))
+}
+
 func ensureCodexMcpConfig(configPath string, mcpConfig json.RawMessage, logger *slog.Logger) error {
 	data, err := os.ReadFile(configPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -976,7 +1003,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// logs redact values, but log redaction cannot protect the process list.
 	// Writing through config.toml at 0o600 keeps the secret values out of argv
 	// entirely.
-	codexHome := strings.TrimSpace(b.cfg.Env["CODEX_HOME"])
+	codexHome := b.resolveCodexHome()
 	if codexHome != "" {
 		if err := ensureCodexMcpConfig(filepath.Join(codexHome, "config.toml"), opts.McpConfig, b.cfg.Logger); err != nil {
 			// Fail closed when we can't materialise the managed config.
@@ -1745,7 +1772,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		// scan this backend's per-task CODEX_HOME, since sessions are isolated
 		// there rather than in the shared ~/.codex/sessions (MUL-4424).
 		if u.InputTokens == 0 && u.OutputTokens == 0 {
-			taskCodexHome := strings.TrimSpace(b.cfg.Env["CODEX_HOME"])
+			taskCodexHome := b.resolveCodexHome()
 			if scanned := scanCodexSessionUsage(startTime, taskCodexHome, threadID, resumed); scanned != nil {
 				u = scanned.usage
 				if scanned.model != "" && opts.Model == "" {

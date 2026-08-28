@@ -4239,7 +4239,8 @@ func TestCodexExecuteFailsClosedWhenMcpConfigInvalid(t *testing.T) {
 }
 
 func TestCodexExecuteFailsClosedWhenManagedMcpButNoCodexHome(t *testing.T) {
-	t.Parallel()
+	// NOT t.Parallel: this now uses t.Setenv to prove CODEX_HOME is unset
+	// everywhere, and Go forbids t.Setenv in a parallel test.
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script fixture is POSIX-only")
 	}
@@ -4248,6 +4249,12 @@ func TestCodexExecuteFailsClosedWhenManagedMcpButNoCodexHome(t *testing.T) {
 	// fail-closed reasoning: silently launching would inherit whatever
 	// MCP setup the host user has, which is the wrong shape of failure.
 	fakePath := writeFakeCodexAppServer(t, "exit 0\n")
+
+	// CODEX_HOME now falls back to the PROCESS env when cfg.Env omits it, so an
+	// empty cfg.Env alone no longer means "unset". Clear it explicitly, or this
+	// test passes or fails depending on the machine it runs on -- which would
+	// make it worthless exactly when it matters.
+	t.Setenv("CODEX_HOME", "")
 
 	backend, err := New("codex", Config{
 		ExecutablePath: fakePath,

@@ -183,6 +183,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		var sessionID string
 		sawAsyncLaunch := false
 		usage := make(map[string]TokenUsage)
+		var modelInventory *ModelInventory
 		eventCount := 0
 		invalidEventCount := 0
 		assistantEventCount := 0
@@ -258,6 +259,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				}
 				trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 			case "result":
+				modelInventory = claudeObservedModelInventory(msg)
 				sawResult = true
 				finalResultText = msg.ResultText
 				resultIsError = msg.IsError
@@ -388,6 +390,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			DurationMs:     duration.Milliseconds(),
 			SessionID:      reportedSessionID,
 			Usage:          usage,
+			ModelInventory: modelInventory,
 			ResumeRejected: resumeRejected,
 		}
 	}()

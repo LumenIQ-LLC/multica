@@ -1767,13 +1767,21 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		u := c.usage
 		c.usageMu.Unlock()
 
+		// Inventory must be observed even when JSON-RPC already supplied billing totals.
+		scannedInventory := scanCodexSessionUsage(startTime, b.resolveCodexHome(), threadID, resumed)
+		var modelInventory *ModelInventory
+		if scannedInventory != nil {
+			modelInventory = scannedInventory.inventory
+			var completed []string
+			c.inventoryCompletedTurns.Range(func(key, _ any) bool { completed = append(completed, key.(string)); return true })
+			modelInventory = scannedInventory.qualifiedInventory(completed)
+		}
 		// Fallback: if no usage from JSON-RPC, scan Codex session JSONL logs.
 		// Codex writes token_count events to $CODEX_HOME/sessions/YYYY/MM/DD/*.jsonl;
 		// scan this backend's per-task CODEX_HOME, since sessions are isolated
 		// there rather than in the shared ~/.codex/sessions (MUL-4424).
 		if u.InputTokens == 0 && u.OutputTokens == 0 {
-			taskCodexHome := b.resolveCodexHome()
-			if scanned := scanCodexSessionUsage(startTime, taskCodexHome, threadID, resumed); scanned != nil {
+			if scanned := scannedInventory; scanned != nil {
 				u = scanned.usage
 				if scanned.model != "" && opts.Model == "" {
 					opts.Model = scanned.model
@@ -1796,6 +1804,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			SessionID:                    threadID,
 			DurationMs:                   duration.Milliseconds(),
 			Usage:                        usageMap,
+			ModelInventory:               modelInventory,
 			codexStartupRefreshRetrySafe: startupRefreshRetrySafe,
 		}
 	}()
@@ -2228,10 +2237,11 @@ type codexClient struct {
 	// filtered history mutate current-turn output or lifecycle state.
 	onDiscardedNotification func(method string, params map[string]any)
 
-	notificationProtocol string // "unknown", "legacy", "raw"
-	turnStarted          bool
-	startedTurnIDs       map[string]bool
-	completedTurnIDs     map[string]bool
+	notificationProtocol    string // "unknown", "legacy", "raw"
+	turnStarted             bool
+	startedTurnIDs          map[string]bool
+	completedTurnIDs        map[string]bool
+	inventoryCompletedTurns sync.Map
 
 	usageMu sync.Mutex
 	usage   TokenUsage // accumulated from turn events
@@ -3240,6 +3250,7 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 				return
 			}
 			c.completedTurnIDs[turnID] = true
+			c.inventoryCompletedTurns.Store(turnID, true)
 		}
 
 		// Extract usage from turn/completed if present (e.g. params.turn.usage).
@@ -3503,8 +3514,10 @@ func codexInt64(m map[string]any, keys ...string) int64 {
 
 // codexSessionUsage holds usage extracted from a Codex session JSONL file.
 type codexSessionUsage struct {
-	usage TokenUsage
-	model string
+	inventory       *ModelInventory
+	observedTurnIDs map[string]bool
+	usage           TokenUsage
+	model           string
 }
 
 // scanCodexSessionUsage extracts usage for threadID from its Codex rollout.
@@ -3683,8 +3696,9 @@ type codexSessionTokenCount struct {
 	Timestamp time.Time `json:"timestamp"`
 	Type      string    `json:"type"`
 	Payload   *struct {
-		Type string `json:"type"`
-		Info *struct {
+		Type   string `json:"type"`
+		TurnID string `json:"turn_id"`
+		Info   *struct {
 			TotalTokenUsage *codexRawTokenUsage `json:"total_token_usage"`
 			LastTokenUsage  *codexRawTokenUsage `json:"last_token_usage"`
 			Model           string              `json:"model"`
@@ -3712,6 +3726,7 @@ func parseCodexSessionFileSince(path string, startTime time.Time, resumed bool) 
 	defer f.Close()
 
 	var result codexSessionUsage
+	var inventory modelInventoryAccumulator
 	var previousTotal, accumulated, finalUsage codexRawTokenUsage
 	previousTotalFound := false
 	finalUsageFound := false
@@ -3730,6 +3745,7 @@ func parseCodexSessionFileSince(path string, startTime time.Time, resumed bool) 
 
 		var evt codexSessionTokenCount
 		if err := json.Unmarshal(line, &evt); err != nil || evt.Payload == nil {
+			inventory.incomplete = true
 			continue
 		}
 		timestampAfterStart := !startTime.IsZero() && !evt.Timestamp.IsZero() && evt.Timestamp.After(startTime)
@@ -3754,6 +3770,15 @@ func parseCodexSessionFileSince(path string, startTime time.Time, resumed bool) 
 					if previousTotalFound {
 						delta = subtractCodexRawTokenUsage(current, previousTotal)
 					}
+					if delta.InputTokens > 0 || delta.OutputTokens > 0 || delta.ReasoningOutputTokens > 0 || delta.CachedInputTokens > 0 {
+						inventory.observe(evt.Payload.Info.Model)
+						if result.observedTurnIDs == nil {
+							result.observedTurnIDs = map[string]bool{}
+						}
+						if evt.Payload.TurnID != "" {
+							result.observedTurnIDs[evt.Payload.TurnID] = true
+						}
+					}
 					accumulated = addCodexRawTokenUsage(accumulated, delta)
 					finalUsage = accumulated
 					finalUsageFound = true
@@ -3764,6 +3789,15 @@ func parseCodexSessionFileSince(path string, startTime time.Time, resumed bool) 
 				// Preserve event order: a later last_token_usage is the same
 				// fallback the old whole-file parser would have selected.
 				finalUsage = normalizeCodexRawTokenUsage(*usage)
+				if finalUsage.InputTokens > 0 || finalUsage.OutputTokens > 0 || finalUsage.ReasoningOutputTokens > 0 || finalUsage.CachedInputTokens > 0 {
+					inventory.observe(evt.Payload.Info.Model)
+					if result.observedTurnIDs == nil {
+						result.observedTurnIDs = map[string]bool{}
+					}
+					if evt.Payload.TurnID != "" {
+						result.observedTurnIDs[evt.Payload.TurnID] = true
+					}
+				}
 				finalUsageFound = true
 			}
 			if evt.Payload.Info.Model != "" {
@@ -3781,6 +3815,7 @@ func parseCodexSessionFileSince(path string, startTime time.Time, resumed bool) 
 		OutputTokens:    finalUsage.OutputTokens + finalUsage.ReasoningOutputTokens,
 		CacheReadTokens: cachedTokens,
 	}
+	result.inventory = inventory.result(scanner.Err() == nil)
 	return &result
 }
 
@@ -3860,4 +3895,21 @@ func nilIfEmpty(s string) any {
 		return nil
 	}
 	return s
+}
+
+// Counts cannot prove coverage: several telemetry events may belong to one turn.
+func (s *codexSessionUsage) qualifiedInventory(completed []string) *ModelInventory {
+	if s == nil || s.inventory == nil {
+		return nil
+	}
+	result := *s.inventory
+	if len(completed) == 0 {
+		result.Complete = false
+	}
+	for _, id := range completed {
+		if !s.observedTurnIDs[id] {
+			result.Complete = false
+		}
+	}
+	return &result
 }

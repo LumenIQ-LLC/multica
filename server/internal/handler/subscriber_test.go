@@ -244,6 +244,8 @@ func TestSubscriberAPI(t *testing.T) {
 		req = withURLParam(req, "id", issueID)
 		req.Header.Set("X-Agent-ID", agentID)
 		req.Header.Set("X-Task-ID", agentTask)
+
+		authenticateTaskActorForTest(req)
 		testHandler.SubscribeToIssue(w, req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("SubscribeToIssue (agent caller): expected 200, got %d: %s", w.Code, w.Body.String())
@@ -281,6 +283,8 @@ func TestSubscriberAPI(t *testing.T) {
 		req = withURLParam(req, "id", issueID)
 		req.Header.Set("X-Agent-ID", agentID)
 		req.Header.Set("X-Task-ID", agentTask)
+
+		authenticateTaskActorForTest(req)
 		testHandler.UnsubscribeFromIssue(w, req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("UnsubscribeFromIssue (agent caller): expected 200, got %d: %s", w.Code, w.Body.String())

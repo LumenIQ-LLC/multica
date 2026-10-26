@@ -225,6 +225,7 @@ func TestPropertyAdminGate(t *testing.T) {
 	req := newRequest("POST", "/api/properties", map[string]any{"name": "AgentMade", "type": "text"})
 	req.Header.Set("X-Actor-Source", "task_token")
 	req.Header.Set("X-Agent-ID", uuid.NewString())
+	authenticateTaskActorForTest(req)
 	testHandler.CreateProperty(w, req)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("agent CreateProperty: expected 403, got %d: %s", w.Code, w.Body.String())
@@ -237,6 +238,7 @@ func TestPropertyAdminGate(t *testing.T) {
 	req = newRequest("PUT", "/api/issues/"+issueID+"/properties/"+property.ID, map[string]any{"value": "set by agent"})
 	req.Header.Set("X-Actor-Source", "task_token")
 	req.Header.Set("X-Agent-ID", uuid.NewString())
+	authenticateTaskActorForTest(req)
 	req = withIssuePropertyParams(req, issueID, property.ID)
 	testHandler.SetIssueProperty(w, req)
 	if w.Code != http.StatusOK {

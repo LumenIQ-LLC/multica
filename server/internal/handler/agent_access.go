@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -34,6 +35,19 @@ import (
 // agent actor: if user U triggers agent A and A @-mentions agent B, B is only
 // invocable when U (the originator) is in B's allow-list. This prevents agents
 // from forming a channel that bypasses the owner's white-list.
+
+// agentActorBindingAllows preserves trusted internal agent actors while checking
+// any HTTP task principal against its bound workspace. resolveActor uses an
+// empty agent ID for refused bindings, so human-only guards stay closed too.
+func agentActorBindingAllows(ctx context.Context, actorID, workspaceID string) bool {
+	if actorID == "" {
+		return false
+	}
+	if actor, ok := middleware.TaskActorFromContext(ctx); ok {
+		return actor.AgentID == actorID && actor.WorkspaceID == workspaceID
+	}
+	return true
+}
 
 // canInvokeAgent reports whether a run may be enqueued for `agent` on behalf of
 // the given actor. Judgement is by the *effective invoking user*:
@@ -71,6 +85,9 @@ func (h *Handler) canInvokeAgent(ctx context.Context, agent db.Agent, actorType,
 // invokeAgentDecision is canInvokeAgent's pure verdict, split out so the gate has
 // exactly one place to observe a denial from.
 func (h *Handler) invokeAgentDecision(ctx context.Context, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) bool {
+	if actorType == "agent" && !agentActorBindingAllows(ctx, actorID, workspaceID) {
+		return false
+	}
 	effectiveUser := actorID
 	if actorType != "member" {
 		// agent / system: never trust the immediate principal, only the
@@ -143,6 +160,9 @@ func (h *Handler) invokeAgentDecision(ctx context.Context, agent db.Agent, actor
 //   - a regular member passes for a public_to agent only when they hit a
 //     workspace or member target; private agents stay owner+admin only.
 func (h *Handler) canAccessPrivateAgent(ctx context.Context, agent db.Agent, actorType, actorID, workspaceID string) bool {
+	if actorType == "agent" && !agentActorBindingAllows(ctx, actorID, workspaceID) {
+		return false
+	}
 	if actorType == "agent" {
 		return true
 	}
@@ -372,6 +392,9 @@ func (h *Handler) taskFromRequestHeader(r *http.Request) (db.AgentTaskQueue, boo
 // private / non-allow-listed agents the member can't access. Returns nil and
 // false on error.
 func (h *Handler) accessibleAgentIDs(ctx context.Context, workspaceID, actorType, actorID, role string) (map[string]struct{}, bool) {
+	if actorType == "agent" && !agentActorBindingAllows(ctx, actorID, workspaceID) {
+		return nil, false
+	}
 	wsUUID, err := util.ParseUUID(workspaceID)
 	if err != nil {
 		return nil, false
@@ -423,6 +446,9 @@ func (h *Handler) accessibleAgentIDs(ctx context.Context, workspaceID, actorType
 // (agent actors, workspace owner/admin) since nothing there can change their
 // answer.
 func (h *Handler) restrictedAgentIDs(ctx context.Context, workspaceID, actorType, actorID, role string) (map[string]struct{}, bool) {
+	if actorType == "agent" && !agentActorBindingAllows(ctx, actorID, workspaceID) {
+		return nil, false
+	}
 	wsUUID, err := util.ParseUUID(workspaceID)
 	if err != nil {
 		return nil, false

@@ -438,6 +438,8 @@ func TestCreateComment_DualRoleAgentWorkerCommentWakesLeader(t *testing.T) {
 	})
 	r.Header.Set("X-Agent-ID", fx.LeaderID)
 	r.Header.Set("X-Task-ID", workerTaskID)
+
+	authenticateTaskActorForTest(r)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
@@ -500,6 +502,8 @@ func TestCreateComment_SquadLeaderMentionTaskDoesNotSelfTriggerAssignedFallback(
 		r := newRequest("POST", "/api/issues/"+issueID+"/comments", body)
 		r.Header.Set("X-Agent-ID", fx.LeaderID)
 		r.Header.Set("X-Task-ID", taskID)
+
+		authenticateTaskActorForTest(r)
 		r = withURLParam(r, "id", issueID)
 		testHandler.CreateComment(w, r)
 		if w.Code != http.StatusCreated {
@@ -583,6 +587,8 @@ func TestCreateComment_SquadLeaderThreadParentTaskDoesNotSelfTriggerAssignedFall
 		r := newRequest("POST", "/api/issues/"+issueID+"/comments", body)
 		r.Header.Set("X-Agent-ID", fx.LeaderID)
 		r.Header.Set("X-Task-ID", taskID)
+
+		authenticateTaskActorForTest(r)
 		r = withURLParam(r, "id", issueID)
 		testHandler.CreateComment(w, r)
 		if w.Code != http.StatusCreated {

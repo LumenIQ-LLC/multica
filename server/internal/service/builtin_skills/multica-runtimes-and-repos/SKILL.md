@@ -51,7 +51,7 @@ multica repo checkout <url> --ref <branch-or-sha>
 
 ## Task CLI boundary
 
-The daemon injects a task-scoped `mat_` credential for Multica API commands and a private task-local Multica configuration root. Inside that managed task context:
+The daemon injects a task-scoped `mat_` credential for Multica API commands and a private task-local Multica configuration root. The API derives agent identity from that validated credential; a human credential plus `X-Agent-ID` / `X-Task-ID` headers remains a member request, even when the headers name a real agent and task. Inside that managed task context:
 
 - API commands such as `issue list`, `issue get`, and `issue runs` use the injected task identity and never fall back to the daemon Owner's saved Multica profile.
 - `config show` and `config set` operate only on task-local Multica state. A missing task config root fails closed.

@@ -866,6 +866,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	}
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
+	var droppedMessages atomic.Int64
 	// Turn control has to follow the attempt that is actually running. A retry
 	// abandons the previous attempt's process entirely, so a control handle
 	// pinned to firstSession would steer or interrupt a turn that no longer
@@ -900,7 +901,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			holdingPins := true
 			flushHeldPins := func() {
 				for _, held := range heldPins {
-					msgCh <- held
+					trySend(msgCh, held, &droppedMessages)
 				}
 				heldPins = nil
 				holdingPins = false
@@ -913,7 +914,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				if holdingPins {
 					flushHeldPins()
 				}
-				msgCh <- msg
+				trySend(msgCh, msg, &droppedMessages)
 			}
 			result, ok := <-session.Result
 			if !ok {
@@ -921,6 +922,8 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				resCh <- Result{Status: "failed", Error: "codex attempt closed without result"}
 				return
 			}
+			droppedMessages.Add(result.DroppedMessages)
+			result.DroppedMessages = 0
 			retryReason := ""
 			switch {
 			case result.codexInitializeRetrySafe:
@@ -967,7 +970,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 
 	return &Session{
 		Messages: msgCh,
-		Result:   resCh,
+		Result:   transcriptResult(resCh, &droppedMessages),
 		turnControl: func(ctx context.Context, req TurnControlRequest) (TurnControlResult, error) {
 			return activeSession.Load().ControlTurn(ctx, req)
 		},
@@ -1131,6 +1134,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
+	var droppedMessages atomic.Int64
 	semanticActivityCh := make(chan string, 256)
 
 	var outputMu sync.Mutex
@@ -1177,7 +1181,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			if activity == "status:running" {
 				firstItemWait.start(time.Now())
 			}
-			trySend(msgCh, msg)
+			trySend(msgCh, msg, &droppedMessages)
 			trySendString(semanticActivityCh, activity)
 			if activity != "" {
 				semanticObserved.Store(true)
@@ -1809,7 +1813,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh, turnControl: c.controlTurn}, nil
+	return &Session{Messages: msgCh, Result: transcriptResult(resCh, &droppedMessages), turnControl: c.controlTurn}, nil
 }
 
 // The continuity notice this backend prepends is supplied by the caller via

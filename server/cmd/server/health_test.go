@@ -11,7 +11,21 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/multica-ai/multica/server/internal/middleware"
 )
+
+func TestReadinessReportsLocalAuthenticationBudget(t *testing.T) {
+	h := &serverHealth{authRateLimitMode: middleware.NewRateLimitHealth(false).Mode}
+	rec := httptest.NewRecorder()
+	h.readyHandler(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	var response readinessResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Checks.AuthRateLimit != "local_per_instance" {
+		t.Fatalf("mode=%q", response.Checks.AuthRateLimit)
+	}
+}
 
 type stubReadinessDB struct {
 	pingErr      error

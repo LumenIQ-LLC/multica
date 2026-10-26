@@ -31,6 +31,8 @@ func TestCreateComment_TriggeredTaskRejectsTopLevelComment(t *testing.T) {
 	r.Header.Set("X-Agent-ID", fx.LeaderID)
 	r.Header.Set("X-Task-ID", fx.TaskID)
 
+	authenticateTaskActorForTest(r)
+
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("CreateComment top-level: expected 409, got %d: %s", w.Code, w.Body.String())
@@ -78,6 +80,8 @@ func TestCreateComment_TriggeredTaskAllowsReplyUnderTrigger(t *testing.T) {
 	r.Header.Set("X-Agent-ID", fx.LeaderID)
 	r.Header.Set("X-Task-ID", fx.TaskID)
 
+	authenticateTaskActorForTest(r)
+
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("CreateComment reply-under-trigger: expected 201, got %d: %s", w.Code, w.Body.String())
@@ -116,6 +120,8 @@ func TestCreateComment_TriggeredTaskRejectsForeignParent(t *testing.T) {
 	r = withURLParam(r, "id", fx.IssueID)
 	r.Header.Set("X-Agent-ID", fx.LeaderID)
 	r.Header.Set("X-Task-ID", fx.TaskID)
+
+	authenticateTaskActorForTest(r)
 
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusConflict {

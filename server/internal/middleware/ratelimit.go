@@ -1,12 +1,16 @@
 package middleware
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"hash/maphash"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -48,8 +52,56 @@ func ParseTrustedProxies(raw string) []*net.IPNet {
 	return nets
 }
 
-// RateLimit returns a per-IP fixed-window rate limiter backed by Redis.
-// If rdb is nil the middleware is a no-op (fail-open).
+// RateLimitHealth exposes degradation without making local-only deployments
+// unready. The emergency limit is per process; Redis enforces the shared limit.
+type RateLimitHealth struct {
+	redisConfigured bool
+	degradedUntil   atomic.Int64
+}
+
+func NewRateLimitHealth(redisConfigured bool) *RateLimitHealth {
+	return &RateLimitHealth{redisConfigured: redisConfigured}
+}
+
+func (h *RateLimitHealth) Mode() string {
+	if !h.redisConfigured || time.Now().UnixNano() < h.degradedUntil.Load() {
+		return "local_per_instance"
+	}
+	return "redis_with_local_guard"
+}
+
+type localRateWindow struct {
+	count   int
+	expires time.Time
+}
+
+// Fixed secret-hash slots bound memory without evicting a hot source and
+// accidentally resetting its budget. Rare collisions conservatively share one
+// slot; there is no global lockout/circuit-breaker on a single source's excess.
+type localRateLimiter struct {
+	mu    sync.Mutex
+	seed  maphash.Seed
+	slots [65536]localRateWindow
+}
+
+func (l *localRateLimiter) allow(key string, limit int, window time.Duration, now time.Time) bool {
+	index := maphash.String(l.seed, key) % uint64(len(l.slots))
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	slot := &l.slots[index]
+	if !now.Before(slot.expires) {
+		*slot = localRateWindow{expires: now.Add(window)}
+	}
+	if slot.count >= limit {
+		return false
+	}
+	slot.count++
+	return true
+}
+
+// RateLimit returns a per-IP fixed-window limiter. A bounded local guard is
+// always reserved first, so Redis failures, recovery and missing configuration
+// cannot repeatedly reset the process's allowance.
 //
 // trustedProxies controls X-Forwarded-For handling: when the direct
 // connection (RemoteAddr) originates from a CIDR in the list, the
@@ -57,33 +109,56 @@ func ParseTrustedProxies(raw string) []*net.IPNet {
 // When the list is empty (default), XFF is never consulted — only
 // RemoteAddr is used. This matches the project's conservative trust
 // model (see health_realtime.go).
-func RateLimit(rdb *redis.Client, limit int, window time.Duration, trustedProxies []*net.IPNet) func(http.Handler) http.Handler {
+func RateLimit(rdb *redis.Client, limit int, window time.Duration, trustedProxies []*net.IPNet, health ...*RateLimitHealth) func(http.Handler) http.Handler {
+	local := &localRateLimiter{seed: maphash.MakeSeed()}
+	status := NewRateLimitHealth(rdb != nil)
+	if len(health) > 0 && health[0] != nil {
+		status = health[0]
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if window < time.Second {
+		window = time.Second
+	}
+	// Bound socket reads/writes as well as the operation context: go-redis
+	// clients need not enable ContextTimeoutEnabled. The clone shares the pool.
+	redisLimiter := rdb
+	if rdb != nil {
+		redisLimiter = rdb.WithTimeout(time.Second)
+	}
 	return func(next http.Handler) http.Handler {
-		if rdb == nil {
-			return next
-		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ip := extractIP(r, trustedProxies)
 			key := rateLimitKey(r.URL.Path, ip)
-			ctx := r.Context()
-
-			count, err := rateLimitScript.Run(ctx, rdb, []string{key}, int(window.Seconds())).Int64()
-			if err != nil {
-				slog.Warn("ratelimit: redis error; allowing request", "error", err, "ip", ip)
-				next.ServeHTTP(w, r)
+			w.Header().Set("X-RateLimit-Mode", status.Mode())
+			if !local.allow(key, limit, window, time.Now()) {
+				writeRateLimit(w, window)
 				return
 			}
-			if count > int64(limit) {
-				w.Header().Set("Retry-After", fmt.Sprintf("%d", int(window.Seconds())))
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusTooManyRequests)
-				json.NewEncoder(w).Encode(map[string]string{"error": "too many requests"})
-				return
+			if redisLimiter != nil {
+				ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+				count, err := rateLimitScript.Run(ctx, redisLimiter, []string{key}, int(window.Seconds())).Int64()
+				cancel()
+				if err != nil {
+					status.degradedUntil.Store(time.Now().Add(time.Minute).UnixNano())
+					w.Header().Set("X-RateLimit-Mode", status.Mode())
+				} else if count > int64(limit) {
+					writeRateLimit(w, window)
+					return
+				}
 			}
 
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func writeRateLimit(w http.ResponseWriter, window time.Duration) {
+	w.Header().Set("Retry-After", fmt.Sprintf("%d", int(window.Seconds())))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": "too many requests"})
 }
 
 // extractIP determines the client IP for rate limiting purposes.

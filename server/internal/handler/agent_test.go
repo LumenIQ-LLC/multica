@@ -1100,6 +1100,8 @@ func TestAgentEnv_AgentActorRejected(t *testing.T) {
 			req = withURLParam(req, "id", targetID)
 			req.Header.Set("X-Agent-ID", hostAgentID)
 			req.Header.Set("X-Task-ID", hostTaskID)
+
+			authenticateTaskActorForTest(req)
 			w := httptest.NewRecorder()
 			tc.fn(w, req)
 			if w.Code != http.StatusForbidden {
@@ -1398,6 +1400,8 @@ func TestUpdateAgent_RedactsMcpConfigForAgentActor(t *testing.T) {
 	req.Header.Set("X-Actor-Source", "task_token")
 	req.Header.Set("X-Agent-ID", caller)
 	req.Header.Set("X-Task-ID", taskID)
+
+	authenticateTaskActorForTest(req)
 	w := httptest.NewRecorder()
 	testHandler.UpdateAgent(w, req)
 	if w.Code != http.StatusOK {

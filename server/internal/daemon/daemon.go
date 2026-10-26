@@ -7702,6 +7702,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 
 	elapsed := time.Since(taskStart).Round(time.Second)
+	if result.TranscriptDeliveryChecked && result.DroppedMessages > 0 {
+		taskLog.Warn("agent transcript incomplete: bounded delivery buffer overflow", "dropped_messages", result.DroppedMessages)
+	}
 	taskLog.Info("agent finished",
 		"status", result.Status,
 		"duration", elapsed.String(),
@@ -8078,6 +8081,12 @@ func shouldRetryWithFreshSession(result agent.Result, priorSessionID string, too
 //
 // Usage is merged across both attempts in every branch so billing is complete.
 func reconcileFreshRetryResult(first agent.Result, firstUsage map[string]agent.TokenUsage, firstTools int32, retry agent.Result, retryTools int32, retryErr error) (agent.Result, int32) {
+	if retryErr == nil {
+		dropped := first.DroppedMessages + retry.DroppedMessages
+		checked := first.TranscriptDeliveryChecked && retry.TranscriptDeliveryChecked
+		first.DroppedMessages, retry.DroppedMessages = dropped, dropped
+		first.TranscriptDeliveryChecked, retry.TranscriptDeliveryChecked = checked, checked
+	}
 	switch {
 	case retryErr != nil:
 		first.Usage = firstUsage

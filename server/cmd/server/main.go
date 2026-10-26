@@ -563,10 +563,7 @@ func main() {
 		LLMMaxRetries:       llmMaxRetries,
 	})
 
-	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: r,
-	}
+	srv := newHTTPServer(":"+port, r)
 	profilingServer := profiling.NewServer()
 
 	// Start background workers.

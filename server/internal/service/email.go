@@ -234,7 +234,11 @@ func NewEmailService() *EmailService {
 	case client != nil:
 		fmt.Printf("EmailService: Resend API from=%s\n", from)
 	default:
-		fmt.Println("EmailService: DEV mode — codes printed to stdout (set MULTICA_DEV_VERIFICATION_CODE in .env for a fixed local code)")
+		if emailDevelopmentFallbackAllowed() {
+			fmt.Println("EmailService: DEV mode — codes printed to stdout (set MULTICA_DEV_VERIFICATION_CODE in .env for a fixed local code)")
+		} else {
+			fmt.Println("EmailService: no email backend configured; production delivery is unavailable")
+		}
 	}
 
 	return &EmailService{
@@ -334,9 +338,15 @@ func (s *EmailService) sendSMTP(to, subject, htmlBody string) error {
 	return c.Quit()
 }
 
+func emailDevelopmentFallbackAllowed() bool {
+	return !strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production")
+}
+
 // SendVerificationCode sends a one-time login code. The code is server-generated
 // (6-digit numeric) so no user-controlled text reaches the email body here.
-// Delivery priority: SMTP relay → Resend API → DEV stdout.
+// Delivery priority: SMTP relay → Resend API → non-production DEV stdout.
+// A production misconfiguration must never log a live authentication code or
+// claim email delivery succeeded.
 func (s *EmailService) SendVerificationCode(to, code string) error {
 	body := fmt.Sprintf(
 		`<div style="font-family: sans-serif; max-width: 400px; margin: 0 auto;">
@@ -350,6 +360,9 @@ func (s *EmailService) SendVerificationCode(to, code string) error {
 		return s.sendSMTP(to, "Your Multica verification code", body)
 	}
 	if s.client == nil {
+		if !emailDevelopmentFallbackAllowed() {
+			return fmt.Errorf("email delivery backend is not configured")
+		}
 		fmt.Printf("[DEV] Verification code for %s: %s\n", to, code)
 		return nil
 	}
@@ -377,6 +390,9 @@ func (s *EmailService) SendInvitationEmail(to, inviterName, workspaceName, invit
 		return s.sendSMTP(to, params.Subject, params.Html)
 	}
 	if s.client == nil {
+		if !emailDevelopmentFallbackAllowed() {
+			return fmt.Errorf("email delivery backend is not configured")
+		}
 		fmt.Printf("[DEV] Invitation email to %s: %s invited you to %s — %s\n", to, inviterName, workspaceName, inviteURL)
 		return nil
 	}

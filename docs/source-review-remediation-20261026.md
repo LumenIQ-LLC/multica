@@ -6,6 +6,13 @@ headers carry no authority. Verification-code consumption and failed attempts
 serialize in short PostgreSQL transactions; provider HTTP calls have finite
 deadlines, response caps and no redirect forwarding.
 
+With APP_ENV=production, missing SMTP/Resend configuration now makes email
+delivery fail without printing verification codes, recipients or invitation
+links. The explicit non-production stdout development fallback remains. This
+does not make an email backend mandatory for unrelated server/SSO features or
+configure a real provider. Existing production environment selection and actual
+mail delivery still require runtime qualification.
+
 HTTP headers, request bodies and idle connections are bounded while intentional
 SSE and WebSocket traffic retain their write lifetime. Auth throttles retain a
 bounded per-source local guard when Redis is missing or fails. Readiness reports

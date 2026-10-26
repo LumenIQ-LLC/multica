@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/smtp"
 	"net/textproto"
@@ -12,6 +13,63 @@ import (
 	"strings"
 	"testing"
 )
+
+func captureEmailFallbackOutput(t *testing.T, run func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stdout
+	func() {
+		os.Stdout = w
+		defer func() { os.Stdout = previous; _ = w.Close() }()
+		run()
+	}()
+	data, err := io.ReadAll(r)
+	_ = r.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func TestEmailDevelopmentFallbackProductionBoundary(t *testing.T) {
+	for _, environment := range []string{"production", " PRODUCTION "} {
+		t.Run(environment, func(t *testing.T) {
+			t.Setenv("APP_ENV", environment)
+			t.Setenv("FRONTEND_ORIGIN", "https://fixture.invalid")
+			s := &EmailService{}
+			var verificationErr, invitationErr error
+			output := captureEmailFallbackOutput(t, func() {
+				verificationErr = s.SendVerificationCode("fixture@example.invalid", "604021")
+				invitationErr = s.SendInvitationEmail("fixture@example.invalid", "Fixture", "Fixture", "synthetic-invitation")
+			})
+			if verificationErr == nil || invitationErr == nil {
+				t.Fatal("production delivery without a backend must fail")
+			}
+			if output != "" {
+				t.Fatal("production fallback must not log code, invitation or recipient")
+			}
+			if strings.Contains(verificationErr.Error(), "604021") || strings.Contains(invitationErr.Error(), "synthetic-invitation") {
+				t.Fatal("delivery error must not expose authentication material")
+			}
+		})
+	}
+}
+
+func TestEmailDevelopmentFallbackRemainsLocal(t *testing.T) {
+	t.Setenv("APP_ENV", "development")
+	s := &EmailService{}
+	var deliveryErr error
+	output := captureEmailFallbackOutput(t, func() { deliveryErr = s.SendVerificationCode("fixture@example.invalid", "604021") })
+	if deliveryErr != nil {
+		t.Fatal(deliveryErr)
+	}
+	if !strings.Contains(output, "604021") {
+		t.Fatal("explicit development fallback must remain available")
+	}
+}
 
 type fakeSMTPAuthClient struct {
 	authErrs   []error

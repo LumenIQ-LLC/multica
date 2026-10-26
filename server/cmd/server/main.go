@@ -285,7 +285,11 @@ func main() {
 		slog.Warn("JWT_SECRET is not set — using insecure dev default (allowed only because APP_ENV is not production).")
 	}
 	if os.Getenv("RESEND_API_KEY") == "" && strings.TrimSpace(os.Getenv("SMTP_HOST")) == "" {
-		slog.Warn("no email backend configured (RESEND_API_KEY and SMTP_HOST both empty) — verification codes will be printed to the log instead of emailed.")
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production") {
+			slog.Warn("no email backend configured — production email delivery is unavailable; configure RESEND_API_KEY or SMTP_HOST.")
+		} else {
+			slog.Warn("no email backend configured (RESEND_API_KEY and SMTP_HOST both empty) — development verification codes will be printed to the log instead of emailed.")
+		}
 	}
 	if os.Getenv("MULTICA_DEV_VERIFICATION_CODE") != "" {
 		if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production") {

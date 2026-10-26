@@ -7,17 +7,23 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const authBodyLimit = 64 << 10
 const jsonBodyLimit = 2 << 20
 const webhookBodyLimit = 10 << 20
+const multipartReadTimeout = 5 * time.Minute
 
 // RequestBodyLimit bounds ordinary JSON even when Content-Type is missing or
 // forged. Buffering before the handler also rejects oversized trailing bytes
 // after an otherwise valid first JSON value. No JSON re-encoding is performed,
 // preserving signed webhook bytes. Streaming responses and upgrades are untouched.
 func RequestBodyLimit(next http.Handler) http.Handler {
+	return requestBodyLimit(next, multipartReadTimeout)
+}
+
+func requestBodyLimit(next http.Handler, uploadTimeout time.Duration) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body == nil || r.Body == http.NoBody {
 			next.ServeHTTP(w, r)
@@ -29,6 +35,13 @@ func RequestBodyLimit(next http.Handler) http.Handler {
 		multipart := strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data")
 		if multipart && (path == "/api/upload-file" || path == "/api/skills/import" ||
 			(strings.HasPrefix(path, "/api/workspaces/") && strings.HasSuffix(path, "/plugins/packages"))) {
+			// A 100MiB upload can legitimately outlast the ordinary 30s body
+			// budget. Extend only these handler-capped multipart reads, keeping
+			// a finite total upload deadline and the original byte limits.
+			if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(uploadTimeout)); err != nil {
+				writeBodyError(w, http.StatusServiceUnavailable, "upload read deadline unavailable")
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}

@@ -3186,6 +3186,9 @@ func TestRootMentionOwnerRoutesMemberReplyButNotAgentReply(t *testing.T) {
 		for k, v := range headers {
 			r.Header.Set(k, v)
 		}
+		if len(headers) > 0 {
+			authenticateTaskActorForTest(r)
+		}
 		testHandler.CreateComment(w, r)
 		return w
 	}

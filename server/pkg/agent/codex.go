@@ -898,28 +898,35 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			// thread that never produced a turn (MUL-5110). The first non-pin
 			// message means the attempt is live: flush and stream from then on.
 			var heldPins []Message
+			var observedSessionID string
 			holdingPins := true
 			flushHeldPins := func() {
 				for _, held := range heldPins {
-					trySend(msgCh, held, &droppedMessages)
+					relayCodexMessage(msgCh, held, &droppedMessages)
 				}
 				heldPins = nil
 				holdingPins = false
 			}
 			for msg := range session.Messages {
+				if msg.Type == MessageStatus && msg.SessionID != "" {
+					observedSessionID = msg.SessionID
+				}
 				if holdingPins && msg.Type == MessageStatus && msg.Status == "running" {
-					heldPins = append(heldPins, msg)
+					if len(heldPins) > 0 {
+						droppedMessages.Add(1)
+					}
+					heldPins = []Message{msg}
 					continue
 				}
 				if holdingPins {
 					flushHeldPins()
 				}
-				trySend(msgCh, msg, &droppedMessages)
+				relayCodexMessage(msgCh, msg, &droppedMessages)
 			}
 			result, ok := <-session.Result
 			if !ok {
 				flushHeldPins()
-				resCh <- Result{Status: "failed", Error: "codex attempt closed without result"}
+				resCh <- Result{Status: "failed", Error: "codex attempt closed without result", SessionID: observedSessionID}
 				return
 			}
 			droppedMessages.Add(result.DroppedMessages)
@@ -932,6 +939,9 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				retryReason = "model_catalog_refresh"
 			}
 			if retryReason == "" || attempt == 2 {
+				if result.SessionID == "" && !result.ResumeRejected {
+					result.SessionID = observedSessionID
+				}
 				flushHeldPins()
 				resCh <- result
 				return
@@ -1181,7 +1191,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			if activity == "status:running" {
 				firstItemWait.start(time.Now())
 			}
-			trySend(msgCh, msg, &droppedMessages)
+			relayCodexMessage(msgCh, msg, &droppedMessages)
 			trySendString(semanticActivityCh, activity)
 			if activity != "" {
 				semanticObserved.Store(true)

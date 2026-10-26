@@ -118,3 +118,45 @@ func TestGetAgent_KnownTaskHeadersCannotBypassPrivateView(t *testing.T) {
 		t.Fatalf("validated task credential lost A2A view: %d %s", w.Code, w.Body.String())
 	}
 }
+
+func TestTaskLineageUsesAuthenticatedTaskContext(t *testing.T) {
+	caller := createHandlerTestAgent(t, "r20-lineage-caller", nil)
+	other := createHandlerTestAgent(t, "r20-lineage-other", nil)
+	boundTask := createHandlerTestTaskForAgent(t, caller)
+	foreignTask := createHandlerTestTaskForAgent(t, other)
+	if _, err := testPool.Exec(context.Background(), "UPDATE agent_task_queue SET originator_user_id=$1, accountable_user_id=$1 WHERE id=$2", testUserID, boundTask); err != nil {
+		t.Fatal(err)
+	}
+	r := newRequest(http.MethodPost, "/api/issues/fixture/comments", nil)
+	r.Header.Set("X-Agent-ID", caller)
+	r.Header.Set("X-Task-ID", boundTask)
+	authenticateTaskActorForTest(r)
+	// A later advisory-header change must not redirect lineage or permissions.
+	r.Header.Set("X-Agent-ID", other)
+	r.Header.Set("X-Task-ID", foreignTask)
+	task, ok := testHandler.taskFromRequestHeader(r)
+	if !ok || uuidToString(task.ID) != boundTask {
+		t.Fatalf("task context lost its binding: ok=%v task=%s", ok, uuidToString(task.ID))
+	}
+	if got := testHandler.invokeOriginatorFromRequest(r, "agent", caller); got != testUserID {
+		t.Fatalf("originator=%q, want authenticated task's human", got)
+	}
+	r.Header.Del("X-Agent-ID")
+	r.Header.Del("X-Task-ID")
+	if task, ok = testHandler.taskFromRequestHeader(r); !ok || uuidToString(task.ID) != boundTask {
+		t.Fatal("stripped advisory headers changed the authenticated task")
+	}
+	forged := newRequest(http.MethodPost, "/api/issues/fixture/comments", nil)
+	forged.Header.Set("X-Agent-ID", caller)
+	forged.Header.Set("X-Task-ID", boundTask)
+	forged.Header.Set("X-Actor-Source", "task_token")
+	if _, ok := testHandler.taskFromRequestHeader(forged); ok {
+		t.Fatal("header-only task acquired lineage authority")
+	}
+	invalid := r.WithContext(middleware.SetTaskActorContext(r.Context(), middleware.TaskActor{
+		UserID: testUserID, AgentID: caller, TaskID: foreignTask, WorkspaceID: testWorkspaceID,
+	}))
+	if _, ok := testHandler.taskFromRequestHeader(invalid); ok {
+		t.Fatal("task belonging to another agent acquired lineage authority")
+	}
+}

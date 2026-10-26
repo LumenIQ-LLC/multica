@@ -8081,12 +8081,11 @@ func shouldRetryWithFreshSession(result agent.Result, priorSessionID string, too
 //
 // Usage is merged across both attempts in every branch so billing is complete.
 func reconcileFreshRetryResult(first agent.Result, firstUsage map[string]agent.TokenUsage, firstTools int32, retry agent.Result, retryTools int32, retryErr error) (agent.Result, int32) {
-	if retryErr == nil {
-		dropped := first.DroppedMessages + retry.DroppedMessages
-		checked := first.TranscriptDeliveryChecked && retry.TranscriptDeliveryChecked
-		first.DroppedMessages, retry.DroppedMessages = dropped, dropped
-		first.TranscriptDeliveryChecked, retry.TranscriptDeliveryChecked = checked, checked
-	}
+	dropped := agent.AccumulateDroppedMessages(first.DroppedMessages, retry.DroppedMessages)
+	checked := first.TranscriptDeliveryChecked && (retry.TranscriptDeliveryChecked || (retryErr != nil && retry.DroppedMessages == 0))
+	first.DroppedMessages, retry.DroppedMessages = dropped, dropped
+	first.TranscriptDeliveryChecked, retry.TranscriptDeliveryChecked = checked, checked
+
 	switch {
 	case retryErr != nil:
 		first.Usage = firstUsage
@@ -8141,7 +8140,15 @@ func freshSessionMayHelp(errText string) bool {
 // messages and is owned by the caller so a same-task retry continues the
 // sequence instead of restarting at 1 — the server orders the transcript by
 // seq alone, and duplicate seqs would interleave the two attempts' rows.
-func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32) (agent.Result, int32, error) {
+func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32) (outcome agent.Result, tools int32, executeErr error) {
+	defer func() {
+		if outcome.DroppedMessages > 0 || outcome.Status == "cancelled" || outcome.Status == "timeout" || outcome.Status == "idle_watchdog" {
+			outcome.DroppedMessages = agent.AccumulateDroppedMessages(outcome.DroppedMessages)
+			if err := d.reportTranscriptGap(taskID, msgSeq, outcome); err != nil {
+				executeErr = fmt.Errorf("transcript completeness marker could not be persisted: %w", err)
+			}
+		}
+	}()
 	// Wrap the caller's ctx so the idle watchdog (below) can interrupt both
 	// the agent subprocess (via the ctx passed to backend.Execute) AND the
 	// drain loop with a single cancel. Without this layer the backend would
@@ -8435,22 +8442,29 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// wide enough for its worst-case exit — an in-flight tick flush plus the
 	// final one, each capped by the 5s ReportTaskMessages timeout and neither
 	// interruptible by the cancel (they post on context.Background()).
-	waitForDrain := func() {
+	waitForDrain := func() bool {
 		select {
 		case <-drainFinished:
+			return true
 		case <-time.After(10 * time.Second):
 			drainCancel()
 			select {
 			case <-drainFinished:
+				return true
 			case <-time.After(12 * time.Second):
-				taskLog.Warn("transcript drain did not stop after cancel; completing anyway")
+				taskLog.Warn("transcript drain did not stop after cancel; refusing terminal success")
+				return false
 			}
 		}
 	}
 
 	select {
 	case result := <-session.Result:
-		waitForDrain()
+		if !waitForDrain() {
+			result.Status = "timeout"
+			result.TranscriptDeliveryChecked = false
+			return result, toolCount.Load(), errors.New("transcript drain did not settle")
+		}
 		if idleWatchdogFired.Load() {
 			// The backend's wait goroutine (e.g. claude.go) translates the
 			// SIGKILL we delivered via agentCancel into Status="aborted".
@@ -8468,16 +8482,25 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		// final flush so the timeout/watchdog/cancel terminals below cannot
 		// hand back (and let runTask fail-and-broadcast) a still-flushing
 		// transcript either.
-		waitForDrain()
+		drained := waitForDrain()
+		var cancelledResult agent.Result
+		select {
+		case cancelledResult = <-session.Result:
+		default:
+		}
+		cancelledResult.TranscriptDeliveryChecked = false
+		if !drained {
+			cancelledResult.Status = "timeout"
+			return cancelledResult, toolCount.Load(), errors.New("transcript drain did not settle")
+		}
 		// Idle watchdog cancels via agentCancel(), which propagates here as
 		// context.Canceled. Check this BEFORE the generic cancelled/timeout
 		// classifiers so a watchdog-induced stop isn't misreported as
 		// "task cancelled by server".
 		if idleWatchdogFired.Load() {
-			return agent.Result{
-				Status: "idle_watchdog",
-				Error:  idleWatchdogReason(time.Duration(idleWatchdogThreshold.Load())),
-			}, toolCount.Load(), nil
+			cancelledResult.Status = "idle_watchdog"
+			cancelledResult.Error = idleWatchdogReason(time.Duration(idleWatchdogThreshold.Load()))
+			return cancelledResult, toolCount.Load(), nil
 		}
 		// Distinguish external cancellation (e.g. server-initiated cancel
 		// because the issue was reassigned, or the user invoked CancelTask)
@@ -8485,15 +8508,13 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		// upstream runCtx fired runCancel(); context.DeadlineExceeded is the
 		// drain deadline expiring on its own.
 		if errors.Is(drainCtx.Err(), context.Canceled) {
-			return agent.Result{
-				Status: "cancelled",
-				Error:  "task cancelled by upstream context (server cancel or daemon shutdown)",
-			}, toolCount.Load(), nil
+			cancelledResult.Status = "cancelled"
+			cancelledResult.Error = "task cancelled by upstream context (server cancel or daemon shutdown)"
+			return cancelledResult, toolCount.Load(), nil
 		}
-		return agent.Result{
-			Status: "timeout",
-			Error:  "agent did not produce result within drain timeout",
-		}, toolCount.Load(), nil
+		cancelledResult.Status = "timeout"
+		cancelledResult.Error = "agent did not produce result within drain timeout"
+		return cancelledResult, toolCount.Load(), nil
 	}
 }
 

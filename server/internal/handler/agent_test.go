@@ -1115,9 +1115,9 @@ func TestAgentEnv_AgentActorRejected(t *testing.T) {
 // model: an agent process that strips its identifying headers
 // (X-Agent-ID / X-Task-ID) but is still authenticated by an `mat_`
 // task token MUST be recognized as actor=agent and rejected on the
-// env endpoint. The auth middleware sets X-Actor-Source=task_token
-// from the token row; resolveActor honors that header before the
-// header-pair fallback. Without this guard the lateral-movement fix
+// env endpoint. The auth middleware sets typed TaskActor context
+// from the token row; resolveActor uses that authenticated context.
+// Without this guard the lateral-movement fix
 // would only block "honest" CLIs that voluntarily set both headers.
 func TestAgentEnv_TaskTokenActorSource(t *testing.T) {
 	if testHandler == nil {
@@ -1132,10 +1132,10 @@ func TestAgentEnv_TaskTokenActorSource(t *testing.T) {
 	req := newRequest(http.MethodGet, "/api/agents/"+targetID+"/env", nil)
 	req = withURLParam(req, "id", targetID)
 	// Simulate the auth middleware's post-mat_-resolution state: the
-	// only header touching actor identity is X-Actor-Source. The agent
-	// process stripped X-Agent-ID and X-Task-ID, hoping to fall back
-	// to the member auth path — the server-set X-Actor-Source must
-	// short-circuit that escape.
+	// typed actor survives a client stripping its advisory identity headers.
+	req.Header.Set("X-Agent-ID", targetID)
+	req.Header.Set("X-Task-ID", createHandlerTestTaskForAgent(t, targetID))
+	authenticateTaskActorForTest(req)
 	req.Header.Set("X-Actor-Source", "task_token")
 	req.Header.Del("X-Agent-ID")
 	req.Header.Del("X-Task-ID")

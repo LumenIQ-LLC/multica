@@ -35,6 +35,26 @@ type stubReadinessDB struct {
 	queryCalls   atomic.Int32
 }
 
+func TestReadinessRetainsAvailabilityWithExplicitFiniteLocalAuthMode(t *testing.T) {
+	for _, mode := range []string{"local_per_instance", "redis_with_local_guard"} {
+		h := &serverHealth{db: &stubReadinessDB{appliedCount: 1}, requiredMigrations: []string{"001_init"},
+			authRateLimitMode: func() string { return mode }}
+		rec := httptest.NewRecorder()
+		h.readyHandler(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		var response readinessResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		want := "ok"
+		if mode == "local_per_instance" {
+			want = "degraded"
+		}
+		if rec.Code != http.StatusOK || response.Status != want || response.Checks.AuthRateLimit != mode {
+			t.Fatalf("mode=%s status=%d body=%+v", mode, rec.Code, response)
+		}
+	}
+}
+
 func (s *stubReadinessDB) Ping(context.Context) error {
 	s.pingCalls.Add(1)
 	return s.pingErr

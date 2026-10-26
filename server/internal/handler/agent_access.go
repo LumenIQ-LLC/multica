@@ -224,8 +224,7 @@ func memberAllowedToViewAgent(agent db.Agent, targets []db.AgentInvocationTarget
 
 // invokeOriginatorFromRequest resolves the top-of-chain human user id for an
 // invocation initiated over HTTP. Members are their own originator; agent
-// actors inherit the originator from the task named by the X-Task-ID header
-// (set by the CLI on every request), matching
+// actors inherit the originator from the authenticated task context, matching
 // TaskService.resolveOriginatorFromTriggerComment. Returns "" when no human
 // can be attributed — canInvokeAgent then fails closed for member/team targets.
 func (h *Handler) invokeOriginatorFromRequest(r *http.Request, actorType, actorID string) string {
@@ -233,12 +232,8 @@ func (h *Handler) invokeOriginatorFromRequest(r *http.Request, actorType, actorI
 		return actorID
 	}
 	if actorType == "agent" {
-		if taskIDHeader := r.Header.Get("X-Task-ID"); taskIDHeader != "" {
-			if taskUUID, err := util.ParseUUID(taskIDHeader); err == nil {
-				if task, err := h.Queries.GetAgentTask(r.Context(), taskUUID); err == nil {
-					return uuidToString(task.OriginatorUserID)
-				}
-			}
+		if task, ok := h.taskFromRequestHeader(r); ok && uuidToString(task.AgentID) == actorID {
+			return uuidToString(task.OriginatorUserID)
 		}
 	}
 	return ""
@@ -268,7 +263,7 @@ func (h *Handler) invokeOriginatorFromRequest(r *http.Request, actorType, actorI
 // on that autopilot's issue. The task.issue_id check below is what keeps that shut:
 // this function is the sole owner of the same-issue requirement, which is why the
 // stamp itself no longer carries it.
-// `task` MUST therefore come from a server-trusted source — the X-Task-ID header
+// `task` MUST therefore come from a server-trusted source — the TaskActor context
 // on create/preview, or the stored comment.source_task_id on reconcile/edit —
 // never a client-supplied field, and authority is granted only when ALL hold:
 //   - the comment author is an agent and IS the task's agent;
@@ -317,8 +312,8 @@ func (h *Handler) autopilotDelegationAuthority(ctx context.Context, issue db.Iss
 
 // autopilotDelegationAuthorityFromRequest resolves the MUL-4857 delegation
 // authority for a comment being created or previewed over HTTP. The speaking task
-// is taken from the server-trusted X-Task-ID header (the CLI stamps it on every
-// agent request); autopilotDelegationAuthority then verifies its lineage. Returns
+// is taken from middleware's TaskActor; autopilotDelegationAuthority then verifies
+// its lineage. Returns
 // "" for member actors or when no valid task is named, keeping the gate closed.
 func (h *Handler) autopilotDelegationAuthorityFromRequest(r *http.Request, issue db.Issue, actorType, actorID string) string {
 	if actorType != "agent" {
@@ -348,7 +343,7 @@ func (h *Handler) autopilotDelegationAuthorityFromComment(ctx context.Context, i
 }
 
 // commentSourceTaskID returns the agent's currently-executing task (from the
-// server-trusted X-Task-ID header), else an invalid UUID. This is the exact
+// middleware's TaskActor context), else an invalid UUID. This is the exact
 // lineage CreateComment stamps onto source_task_id, so an edit re-stamps what a
 // fresh authoring of the same content would have stamped and the two resolvers
 // can never disagree (MUL-6490).
@@ -367,20 +362,20 @@ func (h *Handler) commentSourceTaskID(r *http.Request) pgtype.UUID {
 	return task.ID
 }
 
-// taskFromRequestHeader resolves the agent's currently-executing task from the
-// X-Task-ID header (set by the CLI on every request). Returns ok=false when the
-// header is absent, malformed, or names no existing task.
+// taskFromRequestHeader resolves the currently executing task from middleware's
+// authenticated TaskActor. The legacy helper name is retained, but headers are
+// never authority. The stored task must also belong to the bound agent.
 func (h *Handler) taskFromRequestHeader(r *http.Request) (db.AgentTaskQueue, bool) {
-	taskIDHeader := r.Header.Get("X-Task-ID")
-	if taskIDHeader == "" {
+	actor, ok := middleware.TaskActorFromContext(r.Context())
+	if !ok {
 		return db.AgentTaskQueue{}, false
 	}
-	taskUUID, err := util.ParseUUID(taskIDHeader)
+	taskUUID, err := util.ParseUUID(actor.TaskID)
 	if err != nil {
 		return db.AgentTaskQueue{}, false
 	}
 	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
-	if err != nil {
+	if err != nil || uuidToString(task.AgentID) != actor.AgentID {
 		return db.AgentTaskQueue{}, false
 	}
 	return task, true

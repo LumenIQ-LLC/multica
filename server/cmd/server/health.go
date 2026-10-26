@@ -96,6 +96,9 @@ func (h *serverHealth) readyHandler(w http.ResponseWriter, r *http.Request) {
 	resp, status := h.readiness(r.Context())
 	if h.authRateLimitMode != nil {
 		resp.Checks.AuthRateLimit = h.authRateLimitMode()
+		if status == http.StatusOK && resp.Checks.AuthRateLimit == "local_per_instance" {
+			resp.Status = "degraded"
+		}
 	}
 	writeJSON(w, status, resp)
 }

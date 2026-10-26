@@ -30,6 +30,9 @@ func TestMain(m *testing.M) {
 	case "startup_stdout_burst":
 		runFakeClaudeStartupStdoutBurst()
 		os.Exit(0)
+	case "codex_transcript_overflow":
+		runFakeCodexTranscriptOverflow()
+		os.Exit(0)
 	case "transcript_overflow":
 		for range 600 {
 			fmt.Println(`{"type":"log","log":{"level":"info","message":"fixture"}}`)

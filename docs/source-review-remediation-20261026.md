@@ -13,6 +13,10 @@ does not make an email backend mandatory for unrelated server/SSO features or
 configure a real provider. Existing production environment selection and actual
 mail delivery still require runtime qualification.
 
+SMTP and Resend failures returned to logging callers also discard raw provider
+diagnostics: a provider can reflect the submitted login code or invitation link
+in its error response. Delivery still fails without retry or a success claim.
+
 HTTP headers, request bodies and idle connections are bounded while intentional
 SSE and WebSocket traffic retain their write lifetime. Auth throttles retain a
 bounded per-source local guard when Redis is missing or fails. Readiness reports

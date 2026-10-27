@@ -342,6 +342,16 @@ func emailDevelopmentFallbackAllowed() bool {
 	return !strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production")
 }
 
+// Provider errors may reflect request bodies containing login codes or invitation
+// links. Callers log this error, so neither its message nor its chain may retain
+// the raw diagnostic. A rejected or uncertain send remains a failure, not a retry.
+func safeEmailDeliveryError(err error) error {
+	if err != nil {
+		return fmt.Errorf("email provider delivery failed")
+	}
+	return nil
+}
+
 // SendVerificationCode sends a one-time login code. The code is server-generated
 // (6-digit numeric) so no user-controlled text reaches the email body here.
 // Delivery priority: SMTP relay → Resend API → non-production DEV stdout.
@@ -357,7 +367,7 @@ func (s *EmailService) SendVerificationCode(to, code string) error {
 		</div>`, code)
 
 	if s.smtpHost != "" {
-		return s.sendSMTP(to, "Your Multica verification code", body)
+		return safeEmailDeliveryError(s.sendSMTP(to, "Your Multica verification code", body))
 	}
 	if s.client == nil {
 		if !emailDevelopmentFallbackAllowed() {
@@ -373,7 +383,7 @@ func (s *EmailService) SendVerificationCode(to, code string) error {
 		Html:    body,
 	}
 	_, err := s.client.Emails.Send(params)
-	return err
+	return safeEmailDeliveryError(err)
 }
 
 // SendInvitationEmail notifies the invitee that they have been invited to a workspace.
@@ -387,7 +397,7 @@ func (s *EmailService) SendInvitationEmail(to, inviterName, workspaceName, invit
 
 	if s.smtpHost != "" {
 		params := buildInvitationParams(s.fromEmail, to, inviterName, workspaceName, inviteURL)
-		return s.sendSMTP(to, params.Subject, params.Html)
+		return safeEmailDeliveryError(s.sendSMTP(to, params.Subject, params.Html))
 	}
 	if s.client == nil {
 		if !emailDevelopmentFallbackAllowed() {
@@ -398,7 +408,7 @@ func (s *EmailService) SendInvitationEmail(to, inviterName, workspaceName, invit
 	}
 	params := buildInvitationParams(s.fromEmail, to, inviterName, workspaceName, inviteURL)
 	_, err := s.client.Emails.Send(params)
-	return err
+	return safeEmailDeliveryError(err)
 }
 
 // buildInvitationParams assembles the email request for an invitation.

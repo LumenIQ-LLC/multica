@@ -51,6 +51,8 @@ the existing 8MiB supporting-file plus 1MiB SKILL.md contract. Their finite 55Mi
 wire cap accommodates worst-case JSON escaping and metadata; other ordinary
 routes remain 2MiB, auth 64KiB and webhooks 10MiB. Handler-level validation and
 multipart limits are retained.
+The exact single-file PUT route separately allows a 1MiB file with worst-case
+JSON escaping under a finite 7MiB wire cap.
 
 Claude and Codex Result metadata reports TranscriptDeliveryChecked and
 DroppedMessages independently of final output. Slow consumers can lose bounded

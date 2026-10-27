@@ -100,7 +100,7 @@ func TestRequestBodyLimitSkillExceptionsStayBoundedAndRouteSpecific(t *testing.T
 		{http.MethodPost, "/api/skills/fixture"},
 		{http.MethodPost, "/api/daemon/runtimes/runtime/local-skills/request/result"},
 		{http.MethodPost, "/api/daemon/runtimes/runtime/local-skills/import/request/result/extra"},
-		{http.MethodPut, "/api/skills/fixture/files"},
+		{http.MethodPut, "/api/skills/fixture/files/extra"},
 	} {
 		req := httptest.NewRequest(fixture.method, fixture.path, strings.NewReader("fixture"))
 		req.ContentLength = jsonBodyLimit + 1
@@ -130,6 +130,26 @@ func (repeatedBodyByte) Read(p []byte) (int, error) {
 		p[i] = ' '
 	}
 	return len(p), nil
+}
+
+func TestRequestBodyLimitSingleSkillFilePreservesEscapingWithFiniteCap(t *testing.T) {
+	payload, err := json.Marshal(map[string]string{"path": "fixture.md", "content": strings.Repeat("<", 1<<20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	RequestBodyLimit(okHandler).ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/skills/fixture/files", bytes.NewReader(payload)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("1MiB skill file rejected after valid JSON escaping: %d", rec.Code)
+	}
+	for _, method := range []string{http.MethodPut, http.MethodPost} {
+		req := httptest.NewRequest(method, "/api/skills/fixture/files", io.LimitReader(repeatedBodyByte{}, skillFileBodyLimit+1))
+		rec := httptest.NewRecorder()
+		RequestBodyLimit(okHandler).ServeHTTP(rec, req)
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("method=%s file route has no finite cap: %d", method, rec.Code)
+		}
+	}
 }
 
 func TestRequestBodyLimitOrdinaryAPIAndBoundedUploadExceptions(t *testing.T) {

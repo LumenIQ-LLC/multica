@@ -21,7 +21,12 @@ HTTP headers, request bodies and idle connections are bounded while intentional
 SSE and WebSocket traffic retain their write lifetime. Auth throttles retain a
 bounded per-source local guard when Redis is missing or fails. Readiness reports
 that degraded per-process mode; its aggregate budget depends on replica count.
-Fixed secret-hash slots conservatively share a limit on collisions.
+Exact source keys keep unrelated sources from sharing counters. Each limiter
+retains at most 65,536 live windows, never evicts an active budget and reclaims
+expired entries at most once per second. At capacity, previously unseen sources
+receive HTTP429 until space expires; existing sources retain their own remaining
+allowance. Distributed source pressure can therefore deny new arrivals. This is
+an explicit finite-capacity limitation, not unlimited source isolation.
 
 The selected R24 policy favors bounded auth availability during Redis outages.
 `/readyz` remains HTTP200 when database/schema checks pass, with status=degraded
@@ -33,6 +38,20 @@ needed for a durable fleet-wide quota. Deployments must bound replica count and
 monitor this degraded mode. This choice implements the originally authorized
 finite local fallback, rather than making a Redis outage a global auth outage.
 
+`RATE_LIMIT_TRUSTED_PROXIES` controls forwarded client IPs independently of
+other proxy configuration. With no matching trusted proxy, forwarded headers
+are ignored and all users behind the same reverse proxy share its direct-peer
+allowance (default login-code sends 5/minute per process). This also applies
+without Redis; startup warns about that shared-peer risk. Configure only the
+actual proxy CIDRs, or use direct client connections. The server never trusts
+arbitrary forwarded IPs to recover availability.
+
+Skill create/update and the exact daemon local-skill import-result route retain
+the existing 8MiB supporting-file plus 1MiB SKILL.md contract. Their finite 55MiB
+wire cap accommodates worst-case JSON escaping and metadata; other ordinary
+routes remain 2MiB, auth 64KiB and webhooks 10MiB. Handler-level validation and
+multipart limits are retained.
+
 Claude and Codex Result metadata reports TranscriptDeliveryChecked and
 DroppedMessages independently of final output. Slow consumers can lose bounded
 transcript messages; a final answer does not imply complete transcript delivery.
@@ -40,7 +59,11 @@ Codex relays preserve session pins and fresh-session retries preserve known loss
 counts even on errors. After draining, the daemon stores a renderable error
 message with complete=false and the loss count through the existing task-message
 endpoint before terminal handoff. Failure to store that marker prevents terminal
-success. This adds no event spool or claim that omitted events can be rebuilt.
+success. A checked zero-drop cancellation emits no loss marker. An interrupted
+drain with no confirmed drops reports unknown completeness separately; failure
+to persist that optional cancellation marker preserves the cancellation outcome.
+Completed tasks with confirmed loss still fail closed if their marker cannot be
+stored. This adds no event spool or claim that omitted events can be rebuilt.
 
 Focused acceptance used disposable PostgreSQL, local HTTP servers and fake
 executables. No real provider, account credential or production DB was used.

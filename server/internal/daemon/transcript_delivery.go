@@ -18,11 +18,17 @@ func (d *Daemon) reportTranscriptGap(taskID string, seq *atomic.Int32, result ag
 	if result.Status == "cancelled" || result.Status == "timeout" || result.Status == "idle_watchdog" {
 		reason = "transcript_drain_interrupted"
 	}
+	eventType := "transcript.gap"
+	content := fmt.Sprintf("Transcript incomplete: %s; at least %d messages were dropped. Final output does not certify transcript completeness.", reason, count)
+	if count == 0 && !result.TranscriptDeliveryChecked {
+		eventType = "transcript.completeness_unknown"
+		content = "Transcript completeness is unknown: the drain was interrupted. No dropped-message count was confirmed."
+	}
 	message := TaskMessageData{
 		Seq: int(seq.Add(1)), Type: "error",
-		Content: fmt.Sprintf("Transcript incomplete: %s; at least %d messages were dropped. Final output does not certify transcript completeness.", reason, count),
+		Content: content,
 		Input: map[string]any{
-			"event_type": "transcript.gap", "complete": false,
+			"event_type": eventType, "complete": false,
 			"reason": reason, "dropped_messages": count,
 			"count_capped":     count == agent.MaxDroppedMessages,
 			"delivery_checked": result.TranscriptDeliveryChecked,

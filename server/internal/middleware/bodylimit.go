@@ -13,6 +13,11 @@ import (
 const authBodyLimit = 64 << 10
 const jsonBodyLimit = 2 << 20
 const webhookBodyLimit = 10 << 20
+
+// Existing skill contracts allow 8MiB of supporting files plus a 1MiB
+// SKILL.md. JSON string escaping can expand a byte to six bytes; reserve a
+// further 1MiB for bounded metadata and field names on only these routes.
+const skillBundleBodyLimit = 6*(9<<20) + (1 << 20)
 const multipartReadTimeout = 5 * time.Minute
 
 // RequestBodyLimit bounds ordinary JSON even when Content-Type is missing or
@@ -50,6 +55,8 @@ func requestBodyLimit(next http.Handler, uploadTimeout time.Duration) http.Handl
 			limit = authBodyLimit
 		} else if strings.HasPrefix(path, "/api/webhooks/") {
 			limit = webhookBodyLimit
+		} else if isSkillBundleRequest(r.Method, path) {
+			limit = skillBundleBodyLimit
 		}
 		if r.ContentLength > limit {
 			writeBodyError(w, http.StatusRequestEntityTooLarge, "request body too large")
@@ -70,6 +77,20 @@ func requestBodyLimit(next http.Handler, uploadTimeout time.Duration) http.Handl
 		r.Body = io.NopCloser(bytes.NewReader(payload))
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isSkillBundleRequest(method, path string) bool {
+	path = strings.TrimSuffix(path, "/")
+	if method == http.MethodPost && path == "/api/skills" {
+		return true
+	}
+	parts := strings.Split(path, "/")
+	if method == http.MethodPut {
+		return len(parts) == 4 && parts[0] == "" && parts[1] == "api" && parts[2] == "skills" && parts[3] != ""
+	}
+	return method == http.MethodPost && len(parts) == 9 && parts[0] == "" && parts[1] == "api" &&
+		parts[2] == "daemon" && parts[3] == "runtimes" && parts[4] != "" &&
+		parts[5] == "local-skills" && parts[6] == "import" && parts[7] != "" && parts[8] == "result"
 }
 
 func writeBodyError(w http.ResponseWriter, status int, message string) {

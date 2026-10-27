@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"hash/maphash"
 	"log/slog"
 	"net"
 	"net/http"
@@ -75,27 +74,43 @@ type localRateWindow struct {
 	expires time.Time
 }
 
-// Fixed secret-hash slots bound memory without evicting a hot source and
-// accidentally resetting its budget. Rare collisions conservatively share one
-// slot; there is no global lockout/circuit-breaker on a single source's excess.
+const localRateCapacity = 65536
+
+// Exact keys keep different sources from sharing counters. Live windows are
+// never evicted to admit new keys: at capacity only new sources fail closed.
+// Expired windows are reclaimed at most once per second, bounding sweep work.
 type localRateLimiter struct {
-	mu    sync.Mutex
-	seed  maphash.Seed
-	slots [65536]localRateWindow
+	mu        sync.Mutex
+	windows   map[string]localRateWindow
+	nextSweep time.Time
 }
 
 func (l *localRateLimiter) allow(key string, limit int, window time.Duration, now time.Time) bool {
-	index := maphash.String(l.seed, key) % uint64(len(l.slots))
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	slot := &l.slots[index]
-	if !now.Before(slot.expires) {
-		*slot = localRateWindow{expires: now.Add(window)}
+	if l.windows == nil {
+		l.windows = make(map[string]localRateWindow)
 	}
-	if slot.count >= limit {
+	if !now.Before(l.nextSweep) {
+		for source, entry := range l.windows {
+			if !now.Before(entry.expires) {
+				delete(l.windows, source)
+			}
+		}
+		l.nextSweep = now.Add(time.Second)
+	}
+	entry, found := l.windows[key]
+	if !found || !now.Before(entry.expires) {
+		if !found && len(l.windows) >= localRateCapacity {
+			return false
+		}
+		entry = localRateWindow{expires: now.Add(window)}
+	}
+	if entry.count >= limit {
 		return false
 	}
-	slot.count++
+	entry.count++
+	l.windows[key] = entry
 	return true
 }
 
@@ -110,7 +125,7 @@ func (l *localRateLimiter) allow(key string, limit int, window time.Duration, no
 // RemoteAddr is used. This matches the project's conservative trust
 // model (see health_realtime.go).
 func RateLimit(rdb *redis.Client, limit int, window time.Duration, trustedProxies []*net.IPNet, health ...*RateLimitHealth) func(http.Handler) http.Handler {
-	local := &localRateLimiter{seed: maphash.MakeSeed()}
+	local := &localRateLimiter{}
 	status := NewRateLimitHealth(rdb != nil)
 	if len(health) > 0 && health[0] != nil {
 		status = health[0]

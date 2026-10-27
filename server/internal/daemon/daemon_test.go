@@ -2449,7 +2449,8 @@ func TestExecuteAndDrain_ContextCancelled_FlushesPendingTranscript(t *testing.T)
 	}
 
 	got := rec.snapshot()
-	if len(got) != 2 || got[0].Type != "text" || got[0].Content != "pending tail" || got[1].Input["event_type"] != "transcript.gap" {
+	if len(got) != 2 || got[0].Type != "text" || got[0].Content != "pending tail" ||
+		got[1].Input["event_type"] != "transcript.completeness_unknown" || got[1].Input["complete"] != false || got[1].Input["dropped_messages"] != float64(0) {
 		t.Fatalf("expected the pending tail flushed before the cancelled return, got %+v", got)
 	}
 }

@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -52,6 +53,83 @@ func TestRequestBodyLimitPreservesSignedBytes(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status=%d", rec.Code)
 	}
+}
+
+func TestRequestBodyLimitPreservesExistingSkillBundleContract(t *testing.T) {
+	// Eight 1MiB supporting files plus a 1MiB SKILL.md are supported by
+	// the importers. Go's JSON encoder can expand each '<' to six bytes.
+	content := strings.Repeat("<", 1<<20)
+	files := make([]map[string]string, 8)
+	for i := range files {
+		files[i] = map[string]string{"path": string(rune('a'+i)) + ".md", "content": content}
+	}
+	bundle := map[string]any{"name": "fixture", "content": content, "files": files}
+	for _, path := range []string{"/api/skills", "/api/skills/", "/api/skills/fixture", "/api/daemon/runtimes/runtime/local-skills/import/request/result"} {
+		t.Run(path, func(t *testing.T) {
+			body := bundle
+			if strings.HasPrefix(path, "/api/daemon/") {
+				body = map[string]any{"status": "completed", "skill": bundle}
+			}
+			payload, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := RequestBodyLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n, err := io.Copy(io.Discard, r.Body)
+				if err != nil || n != int64(len(payload)) {
+					t.Errorf("bundle was changed or truncated: bytes=%d error=%v", n, err)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			rec := httptest.NewRecorder()
+			method := http.MethodPost
+			if path == "/api/skills/fixture" {
+				method = http.MethodPut
+			}
+			h.ServeHTTP(rec, httptest.NewRequest(method, path, bytes.NewReader(payload)))
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("valid existing bundle rejected: bytes=%d status=%d", len(payload), rec.Code)
+			}
+		})
+	}
+}
+
+func TestRequestBodyLimitSkillExceptionsStayBoundedAndRouteSpecific(t *testing.T) {
+	for _, fixture := range []struct{ method, path string }{
+		{http.MethodPost, "/api/skills/search"},
+		{http.MethodPost, "/api/skills/fixture"},
+		{http.MethodPost, "/api/daemon/runtimes/runtime/local-skills/request/result"},
+		{http.MethodPost, "/api/daemon/runtimes/runtime/local-skills/import/request/result/extra"},
+		{http.MethodPut, "/api/skills/fixture/files"},
+	} {
+		req := httptest.NewRequest(fixture.method, fixture.path, strings.NewReader("fixture"))
+		req.ContentLength = jsonBodyLimit + 1
+		rec := httptest.NewRecorder()
+		RequestBodyLimit(okHandler).ServeHTTP(rec, req)
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("unrelated %s %s bypassed ordinary cap: %d", fixture.method, fixture.path, rec.Code)
+		}
+	}
+	for _, knownLength := range []bool{true, false} {
+		req := httptest.NewRequest(http.MethodPost, "/api/skills", io.LimitReader(repeatedBodyByte{}, skillBundleBodyLimit+1))
+		if knownLength {
+			req.ContentLength = skillBundleBodyLimit + 1
+		}
+		rec := httptest.NewRecorder()
+		RequestBodyLimit(okHandler).ServeHTTP(rec, req)
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("skill cap unbounded, knownLength=%v status=%d", knownLength, rec.Code)
+		}
+	}
+}
+
+type repeatedBodyByte struct{}
+
+func (repeatedBodyByte) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = ' '
+	}
+	return len(p), nil
 }
 
 func TestRequestBodyLimitOrdinaryAPIAndBoundedUploadExceptions(t *testing.T) {

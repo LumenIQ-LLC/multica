@@ -8142,10 +8142,17 @@ func freshSessionMayHelp(errText string) bool {
 // seq alone, and duplicate seqs would interleave the two attempts' rows.
 func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32) (outcome agent.Result, tools int32, executeErr error) {
 	defer func() {
-		if outcome.DroppedMessages > 0 || outcome.Status == "cancelled" || outcome.Status == "timeout" || outcome.Status == "idle_watchdog" {
+		interrupted := outcome.Status == "cancelled" || outcome.Status == "timeout" || outcome.Status == "idle_watchdog"
+		if outcome.DroppedMessages > 0 || (interrupted && !outcome.TranscriptDeliveryChecked) {
 			outcome.DroppedMessages = agent.AccumulateDroppedMessages(outcome.DroppedMessages)
 			if err := d.reportTranscriptGap(taskID, msgSeq, outcome); err != nil {
-				executeErr = fmt.Errorf("transcript completeness marker could not be persisted: %w", err)
+				if interrupted {
+					// A diagnostic delivery failure must not replace the user's
+					// cancellation or the existing timeout/watchdog disposition.
+					taskLog.Warn("interrupted transcript completeness marker could not be persisted", "task_id", taskID, "status", outcome.Status)
+				} else {
+					executeErr = fmt.Errorf("transcript completeness marker could not be persisted: %w", err)
+				}
 			}
 		}
 	}()

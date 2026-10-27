@@ -1292,10 +1292,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/plugin-surfaces/{token}", h.ServePluginSurface)
 
 	// Auth (public) — per-IP rate limiting.
+	trustedProxies := middleware.ParseTrustedProxies(os.Getenv("RATE_LIMIT_TRUSTED_PROXIES"))
 	if rdb == nil {
 		slog.Warn("auth rate limiting uses bounded per-instance local guard: REDIS_URL not configured")
+		if len(trustedProxies) == 0 {
+			slog.Warn("auth rate limiting ignores forwarded IPs without RATE_LIMIT_TRUSTED_PROXIES: users behind a reverse proxy share its per-peer budget; trust only your own proxy CIDRs")
+		}
 	}
-	trustedProxies := middleware.ParseTrustedProxies(os.Getenv("RATE_LIMIT_TRUSTED_PROXIES"))
 	authRL := middleware.RateLimit(rdb, envPositiveInt("RATE_LIMIT_AUTH", 5), time.Minute, trustedProxies, authRateLimitHealth)
 	authVerifyRL := middleware.RateLimit(rdb, envPositiveInt("RATE_LIMIT_AUTH_VERIFY", 20), time.Minute, trustedProxies, authRateLimitHealth)
 	contactSalesRL := middleware.RateLimit(rdb, envPositiveInt("RATE_LIMIT_CONTACT_SALES", 5), time.Hour, trustedProxies, authRateLimitHealth)

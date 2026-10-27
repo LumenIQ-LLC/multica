@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -134,5 +135,46 @@ func TestTranscriptKnownRetryLossPersistsEvenWhenCompletenessIsUnknown(t *testin
 	recorded := rec.snapshot()
 	if len(recorded) != 1 || recorded[0].Input["dropped_messages"] != float64(7) || recorded[0].Input["delivery_checked"] != false || recorded[0].Input["complete"] != false {
 		t.Fatalf("known retry loss not durably reported: %+v", recorded)
+	}
+}
+
+func TestZeroDropCancellationDoesNotFailForCompletenessMarker(t *testing.T) {
+	for _, checked := range []bool{true, false} {
+		t.Run(fmt.Sprintf("checked=%v", checked), func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer server.Close()
+			messages := make(chan agent.Message)
+			close(messages)
+			results := make(chan agent.Result, 1)
+			results <- agent.Result{Status: "cancelled", TranscriptDeliveryChecked: checked}
+			d := &Daemon{client: NewClient(server.URL), logger: slog.Default()}
+			result, _, err := d.executeAndDrain(context.Background(), sessionBackend{session: &agent.Session{Messages: messages, Result: results}}, "fixture", agent.ExecOptions{}, slog.Default(), "task-cancel", "", new(atomic.Int32))
+			if err != nil || result.Status != "cancelled" || result.DroppedMessages != 0 {
+				t.Fatalf("marker changed ordinary cancellation: result=%+v error=%v", result, err)
+			}
+			if checked && calls.Load() != 0 {
+				t.Fatal("fully checked zero-drop cancellation emitted a false gap")
+			}
+		})
+	}
+}
+
+func TestZeroDropInterruptedTranscriptReportsUnknownCompleteness(t *testing.T) {
+	d, rec := newTranscriptRecorder(t)
+	messages := make(chan agent.Message)
+	close(messages)
+	results := make(chan agent.Result, 1)
+	results <- agent.Result{Status: "cancelled", TranscriptDeliveryChecked: false}
+	_, _, err := d.executeAndDrain(context.Background(), sessionBackend{session: &agent.Session{Messages: messages, Result: results}}, "fixture", agent.ExecOptions{}, slog.Default(), "task-unknown", "", new(atomic.Int32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reported := rec.snapshot()
+	if len(reported) != 1 || reported[0].Input["event_type"] != "transcript.completeness_unknown" || !strings.Contains(reported[0].Content, "unknown") || strings.Contains(reported[0].Content, "were dropped") {
+		t.Fatalf("unknown completeness was misreported as confirmed loss: %+v", reported)
 	}
 }

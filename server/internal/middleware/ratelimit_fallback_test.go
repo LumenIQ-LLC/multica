@@ -2,7 +2,7 @@ package middleware
 
 import (
 	"fmt"
-	"hash/maphash"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -71,22 +71,81 @@ func TestRateLimitRedisFailureRetainsBudgetAndReportsMode(t *testing.T) {
 	}
 }
 
-func TestLocalRateSlotsExpireWithoutEvictionAndStayBounded(t *testing.T) {
-	l := &localRateLimiter{seed: maphash.MakeSeed()}
+func TestLocalRateWindowsIsolateSourcesExpireAndStayBounded(t *testing.T) {
+	l := &localRateLimiter{}
 	now := time.Unix(1000, 0)
-	if !l.allow("fixture", 1, time.Minute, now) || l.allow("fixture", 1, time.Minute, now) {
+	if !l.allow("fixture", 2, time.Minute, now) {
 		t.Fatal("local allowance failed")
 	}
 	for i := range 100000 {
 		l.allow(fmt.Sprint(i), 1, time.Minute, now)
 	}
-	if l.allow("fixture", 1, time.Minute, now) {
+	if !l.allow("fixture", 2, time.Minute, now) {
+		t.Fatal("rotating other keys consumed a live source's budget")
+	}
+	if l.allow("fixture", 2, time.Minute, now) {
 		t.Fatal("hot budget reset after key pressure")
 	}
-	if len(l.slots) != 65536 {
+	if len(l.windows) != localRateCapacity {
 		t.Fatal("local storage grew")
 	}
-	if !l.allow("fixture", 1, time.Minute, now.Add(time.Minute)) {
-		t.Fatal("expired budget did not reset")
+	if l.allow("new-source-at-capacity", 1, time.Minute, now) {
+		t.Fatal("new source bypassed finite capacity")
+	}
+	if !l.allow("new-source-after-expiry", 1, time.Minute, now.Add(time.Minute)) || len(l.windows) != 1 {
+		t.Fatal("expired windows were not reclaimed")
+	}
+}
+
+func TestRateLimitLocalFallbackPreservesExplicitProxyTrust(t *testing.T) {
+	_, proxy, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, trusted := range []bool{false, true} {
+		var proxies []*net.IPNet
+		if trusted {
+			proxies = []*net.IPNet{proxy}
+		}
+		h := RateLimit(nil, 1, time.Minute, proxies)(okHandler)
+		for i, forwarded := range []string{"203.0.113.1", "203.0.113.2"} {
+			req := httptest.NewRequest(http.MethodPost, "/auth/send-code", nil)
+			req.RemoteAddr = "10.0.0.1:1234"
+			req.Header.Set("X-Forwarded-For", forwarded)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			want := http.StatusOK
+			if i > 0 && !trusted {
+				want = http.StatusTooManyRequests
+			}
+			if rec.Code != want {
+				t.Fatalf("trusted=%v client=%d status=%d want=%d", trusted, i, rec.Code, want)
+			}
+		}
+	}
+}
+
+func TestLocalRateCapacityIsAtomicForNewSources(t *testing.T) {
+	l := &localRateLimiter{}
+	now := time.Unix(1000, 0)
+	for i := range localRateCapacity - 1 {
+		if !l.allow(fmt.Sprint(i), 1, time.Minute, now) {
+			t.Fatal("capacity exhausted prematurely")
+		}
+	}
+	var admitted atomic.Int32
+	var wg sync.WaitGroup
+	for i := range 128 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if l.allow(fmt.Sprintf("new-%d", i), 1, time.Minute, now) {
+				admitted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if admitted.Load() != 1 || len(l.windows) != localRateCapacity {
+		t.Fatalf("capacity raced: admitted=%d windows=%d", admitted.Load(), len(l.windows))
 	}
 }

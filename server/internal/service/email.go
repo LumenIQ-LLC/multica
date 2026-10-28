@@ -339,7 +339,7 @@ func (s *EmailService) sendSMTP(to, subject, htmlBody string) error {
 }
 
 func emailDevelopmentFallbackAllowed() bool {
-	return !strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production")
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "development")
 }
 
 // Provider errors may reflect request bodies containing login codes or invitation

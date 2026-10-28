@@ -24,12 +24,31 @@ const multipartReadTimeout = 5 * time.Minute
 // RequestBodyLimit bounds ordinary JSON even when Content-Type is missing or
 // forged. Buffering before the handler also rejects oversized trailing bytes
 // after an otherwise valid first JSON value. No JSON re-encoding is performed,
-// preserving signed webhook bytes. Streaming responses and upgrades are untouched.
+// preserving signed webhook bytes. Large skill bodies are capped lazily here;
+// AuthenticatedSkillBodyLimit buffers them only after user/daemon authentication.
+// Streaming responses and upgrades are untouched.
 func RequestBodyLimit(next http.Handler) http.Handler {
 	return requestBodyLimit(next, multipartReadTimeout)
 }
 
 func requestBodyLimit(next http.Handler, uploadTimeout time.Duration) http.Handler {
+	return limitRequestBody(next, uploadTimeout, false)
+}
+
+// AuthenticatedSkillBodyLimit must follow Auth or DaemonAuth. It preserves the
+// full-body/trailing-byte check without allocating large buffers for rejected callers.
+func AuthenticatedSkillBodyLimit(next http.Handler) http.Handler {
+	buffered := limitRequestBody(next, multipartReadTimeout, true)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isSkillBundleRequest(r.Method, r.URL.Path) || isSkillFileRequest(r.Method, r.URL.Path) {
+			buffered.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func limitRequestBody(next http.Handler, uploadTimeout time.Duration, authenticated bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body == nil || r.Body == http.NoBody {
 			next.ServeHTTP(w, r)
@@ -66,6 +85,11 @@ func requestBodyLimit(next http.Handler, uploadTimeout time.Duration) http.Handl
 			return
 		}
 		body := http.MaxBytesReader(w, r.Body, limit)
+		if !authenticated && (isSkillBundleRequest(r.Method, path) || isSkillFileRequest(r.Method, path)) {
+			r.Body = body
+			next.ServeHTTP(w, r)
+			return
+		}
 		payload, err := io.ReadAll(body)
 		_ = body.Close()
 		if err != nil {

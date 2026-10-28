@@ -6,9 +6,10 @@ headers carry no authority. Verification-code consumption and failed attempts
 serialize in short PostgreSQL transactions; provider HTTP calls have finite
 deadlines, response caps and no redirect forwarding.
 
-With APP_ENV=production, missing SMTP/Resend configuration now makes email
-delivery fail without printing verification codes, recipients or invitation
-links. The explicit non-production stdout development fallback remains. This
+Without SMTP/Resend configuration, email delivery fails without printing
+verification codes, recipients or invitation links unless APP_ENV is explicitly
+set to development. Unset, production, prod, staging and unknown values fail
+closed. The explicitly selected development stdout fallback remains. This
 does not make an email backend mandatory for unrelated server/SSO features or
 configure a real provider. Existing production environment selection and actual
 mail delivery still require runtime qualification.
@@ -50,7 +51,10 @@ Skill create/update and the exact daemon local-skill import-result route retain
 the existing 8MiB supporting-file plus 1MiB SKILL.md contract. Their finite 55MiB
 wire cap accommodates worst-case JSON escaping and metadata; other ordinary
 routes remain 2MiB, auth 64KiB and webhooks 10MiB. Handler-level validation and
-multipart limits are retained.
+multipart limits are retained. Large skill JSON bodies are wrapped in a byte
+cap globally but buffered only after the existing user or daemon authentication;
+rejected unauthenticated callers do not cause a skill-body read. Authenticated
+requests still reject oversized trailing bytes before the handler.
 The exact single-file PUT route separately allows a 1MiB file with worst-case
 JSON escaping under a finite 7MiB wire cap.
 

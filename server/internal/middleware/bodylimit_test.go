@@ -16,6 +16,38 @@ import (
 
 type deadlineRecorder struct{ *httptest.ResponseRecorder }
 
+type observedRequestBody struct{ reads int }
+
+func (b *observedRequestBody) Read([]byte) (int, error) {
+	b.reads++
+	return 0, io.EOF
+}
+func (*observedRequestBody) Close() error { return nil }
+
+func TestRequestBodyLimitRejectsUnauthenticatedSkillWithoutReadingBody(t *testing.T) {
+	for _, fixture := range []struct{ method, path string }{
+		{http.MethodPost, "/api/skills"},
+		{http.MethodPut, "/api/skills/fixture"},
+		{http.MethodPut, "/api/skills/fixture/files"},
+		{http.MethodPost, "/api/daemon/runtimes/runtime/local-skills/import/request/result"},
+	} {
+		for _, length := range []int64{-1, 1 << 20} {
+			body := &observedRequestBody{}
+			req := httptest.NewRequest(fixture.method, fixture.path, nil)
+			req.Body, req.ContentLength = body, length
+			authenticate := Auth(nil, nil, nil)
+			if strings.HasPrefix(fixture.path, "/api/daemon/") {
+				authenticate = DaemonAuth(nil, nil, nil, nil)
+			}
+			rec := httptest.NewRecorder()
+			RequestBodyLimit(authenticate(AuthenticatedSkillBodyLimit(okHandler))).ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized || body.reads != 0 {
+				t.Fatalf("%s %s length=%d status=%d pre-auth body reads=%d", fixture.method, fixture.path, length, rec.Code, body.reads)
+			}
+		}
+	}
+}
+
 func (*deadlineRecorder) SetReadDeadline(time.Time) error { return nil }
 
 func TestRequestBodyLimitRejectsBeforeHandler(t *testing.T) {
@@ -74,13 +106,13 @@ func TestRequestBodyLimitPreservesExistingSkillBundleContract(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			h := RequestBodyLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h := RequestBodyLimit(AuthenticatedSkillBodyLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				n, err := io.Copy(io.Discard, r.Body)
 				if err != nil || n != int64(len(payload)) {
 					t.Errorf("bundle was changed or truncated: bytes=%d error=%v", n, err)
 				}
 				w.WriteHeader(http.StatusNoContent)
-			}))
+			})))
 			rec := httptest.NewRecorder()
 			method := http.MethodPost
 			if path == "/api/skills/fixture" {
@@ -116,7 +148,7 @@ func TestRequestBodyLimitSkillExceptionsStayBoundedAndRouteSpecific(t *testing.T
 			req.ContentLength = skillBundleBodyLimit + 1
 		}
 		rec := httptest.NewRecorder()
-		RequestBodyLimit(okHandler).ServeHTTP(rec, req)
+		RequestBodyLimit(AuthenticatedSkillBodyLimit(okHandler)).ServeHTTP(rec, req)
 		if rec.Code != http.StatusRequestEntityTooLarge {
 			t.Fatalf("skill cap unbounded, knownLength=%v status=%d", knownLength, rec.Code)
 		}
@@ -138,14 +170,14 @@ func TestRequestBodyLimitSingleSkillFilePreservesEscapingWithFiniteCap(t *testin
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
-	RequestBodyLimit(okHandler).ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/skills/fixture/files", bytes.NewReader(payload)))
+	RequestBodyLimit(AuthenticatedSkillBodyLimit(okHandler)).ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/skills/fixture/files", bytes.NewReader(payload)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("1MiB skill file rejected after valid JSON escaping: %d", rec.Code)
 	}
 	for _, method := range []string{http.MethodPut, http.MethodPost} {
 		req := httptest.NewRequest(method, "/api/skills/fixture/files", io.LimitReader(repeatedBodyByte{}, skillFileBodyLimit+1))
 		rec := httptest.NewRecorder()
-		RequestBodyLimit(okHandler).ServeHTTP(rec, req)
+		RequestBodyLimit(AuthenticatedSkillBodyLimit(okHandler)).ServeHTTP(rec, req)
 		if rec.Code != http.StatusRequestEntityTooLarge {
 			t.Fatalf("method=%s file route has no finite cap: %d", method, rec.Code)
 		}

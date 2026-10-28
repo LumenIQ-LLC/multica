@@ -90,7 +90,7 @@ func captureEmailFallbackOutput(t *testing.T, run func()) string {
 }
 
 func TestEmailDevelopmentFallbackProductionBoundary(t *testing.T) {
-	for _, environment := range []string{"production", " PRODUCTION "} {
+	for _, environment := range []string{"production", " PRODUCTION ", "", "prod", "staging", "test", "developmnt"} {
 		t.Run(environment, func(t *testing.T) {
 			t.Setenv("APP_ENV", environment)
 			t.Setenv("FRONTEND_ORIGIN", "https://fixture.invalid")

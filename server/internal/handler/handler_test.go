@@ -2289,7 +2289,7 @@ func TestVerifyCodeRejectsDevCodeUnlessExplicitlyConfigured(t *testing.T) {
 	}
 }
 
-func TestVerifyCodeAcceptsConfiguredDevCodeOutsideProduction(t *testing.T) {
+func TestVerifyCodeAcceptsConfiguredDevCodeInDevelopment(t *testing.T) {
 	t.Setenv(devVerificationCodeEnv, "888888")
 	t.Setenv("APP_ENV", "development")
 

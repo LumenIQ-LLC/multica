@@ -120,7 +120,7 @@ func generateCode() (string, error) {
 }
 
 func isDevVerificationCode(code string) bool {
-	if isProductionEnv() {
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "development") {
 		return false
 	}
 
@@ -130,10 +130,6 @@ func isDevVerificationCode(code string) bool {
 	}
 
 	return subtle.ConstantTimeCompare([]byte(code), []byte(devCode)) == 1
-}
-
-func isProductionEnv() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production")
 }
 
 func isSixDigitCode(code string) bool {

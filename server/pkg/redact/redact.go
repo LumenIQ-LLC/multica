@@ -171,11 +171,18 @@ func Text(s string) string {
 		s = p.re.ReplaceAllString(s, p.replacement)
 	}
 
-	// Redact home directory paths (e.g. /Users/john/ → /Users/****/).
-	if homeDir != "" && username != "" {
-		masked := strings.Replace(homeDir, username, "****", 1)
-		s = strings.ReplaceAll(s, homeDir, masked)
-	}
+	return redactHomeDirectory(s, homeDir, username)
+}
 
-	return s
+func redactHomeDirectory(s, home, userName string) string {
+	if home == "" {
+		return s
+	}
+	// A valid home need not contain the account name (for example a service
+	// account's /nonexistent). Never leave a known private prefix unmasked.
+	masked := "****"
+	if userName != "" && strings.Contains(home, userName) {
+		masked = strings.Replace(home, userName, "****", 1)
+	}
+	return strings.ReplaceAll(s, home, masked)
 }

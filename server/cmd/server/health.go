@@ -37,6 +37,7 @@ type serverHealth struct {
 	cacheTTL           time.Duration
 	refreshMu          sync.Mutex
 	cache              atomic.Pointer[cachedReadiness]
+	authRateLimitMode  func() string
 	// startedAt and pid identify the process answering /health. A 200 alone
 	// only proves something is listening on the port: when a restart fails to
 	// bind, the previous instance keeps serving and every readiness check
@@ -66,8 +67,9 @@ type readinessResponse struct {
 }
 
 type readinessChecks struct {
-	DB         string `json:"db"`
-	Migrations string `json:"migrations"`
+	DB            string `json:"db"`
+	Migrations    string `json:"migrations"`
+	AuthRateLimit string `json:"auth_rate_limit,omitempty"`
 }
 
 func newServerHealth(pool *pgxpool.Pool) *serverHealth {
@@ -92,6 +94,12 @@ func (h *serverHealth) liveHandler(w http.ResponseWriter, _ *http.Request) {
 
 func (h *serverHealth) readyHandler(w http.ResponseWriter, r *http.Request) {
 	resp, status := h.readiness(r.Context())
+	if h.authRateLimitMode != nil {
+		resp.Checks.AuthRateLimit = h.authRateLimitMode()
+		if status == http.StatusOK && resp.Checks.AuthRateLimit == "local_per_instance" {
+			resp.Status = "degraded"
+		}
+	}
 	writeJSON(w, status, resp)
 }
 

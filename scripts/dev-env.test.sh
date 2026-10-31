@@ -71,6 +71,40 @@ EOF
 
 out="$tmp_dir/out"
 
+# Fixed codes are an explicit development-only shortcut. Refusal must happen
+# before an existing file is changed, including when a fixed code already exists.
+code_root="$tmp_dir/fixed-code"
+mkdir -p "$code_root"
+for mode in unset empty production prod staging test development-later-staging; do
+  case "$mode" in
+    unset) printf 'MULTICA_DEV_VERIFICATION_CODE=123456\n' > "$code_root/fixture.env" ;;
+    empty) printf 'APP_ENV=\nMULTICA_DEV_VERIFICATION_CODE=123456\n' > "$code_root/fixture.env" ;;
+    development-later-staging) printf 'APP_ENV=development\nAPP_ENV=staging\nMULTICA_DEV_VERIFICATION_CODE=123456\n' > "$code_root/fixture.env" ;;
+    *) printf 'APP_ENV=%s\nMULTICA_DEV_VERIFICATION_CODE=123456\n' "$mode" > "$code_root/fixture.env" ;;
+  esac
+  cp "$code_root/fixture.env" "$code_root/original.env"
+  if bash -c 'source "$1"; REPO_ROOT="$2"; ensure_dev_code fixture.env' _ \
+    "$root_dir/scripts/dev-env.sh" "$code_root" > "$out" 2>&1; then
+    fail "fixed-code helper accepted $mode"
+  fi
+  cmp -s "$code_root/fixture.env" "$code_root/original.env" || fail "refusal changed $mode environment"
+  require_contains "$out" 'require APP_ENV=development'
+done
+for mode in development '"development"' "'development'"; do
+  printf 'APP_ENV=%s\nMULTICA_DEV_VERIFICATION_CODE=\n' "$mode" > "$code_root/fixture.env"
+  bash -c 'source "$1"; REPO_ROOT="$2"; ensure_dev_code fixture.env' _ \
+    "$root_dir/scripts/dev-env.sh" "$code_root" > "$out" 2>&1 || fail "explicit development refused"
+  require_contains "$code_root/fixture.env" 'MULTICA_DEV_VERIFICATION_CODE=888888'
+done
+printf 'APP_ENV=$(touch should-not-exist)\n' > "$code_root/fixture.env"
+if (cd "$code_root" && bash -c 'source "$1"; REPO_ROOT="$2"; ensure_dev_code fixture.env' _ \
+  "$root_dir/scripts/dev-env.sh" "$code_root") > "$out" 2>&1; then
+  fail "fixed-code helper accepted executable mode text"
+fi
+[ ! -e "$code_root/should-not-exist" ] || fail "fixed-code mode inspection executed environment text"
+WORKTREE_NAME=fixed-code-test bash "$root_dir/scripts/init-worktree-env.sh" "$code_root/generated.env" > "$out"
+require_contains "$code_root/generated.env" 'APP_ENV=development'
+
 # ---------------------------------------------------------------------------
 # An empty registry is a normal state, not an error.
 # ---------------------------------------------------------------------------

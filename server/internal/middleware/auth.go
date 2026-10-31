@@ -17,6 +17,29 @@ import (
 
 func uuidToString(u pgtype.UUID) string { return util.UUIDToString(u) }
 
+// TaskActor is the identity bound to a validated task credential. HTTP headers
+// are compatibility metadata; they do not establish this authority.
+type TaskActor struct {
+	UserID      string
+	AgentID     string
+	TaskID      string
+	WorkspaceID string
+}
+
+type taskActorContextKey struct{}
+
+// TaskActorFromContext returns the server-authenticated task identity.
+func TaskActorFromContext(ctx context.Context) (TaskActor, bool) {
+	actor, ok := ctx.Value(taskActorContextKey{}).(TaskActor)
+	return actor, ok && actor.UserID != "" && actor.AgentID != "" && actor.TaskID != "" && actor.WorkspaceID != ""
+}
+
+// SetTaskActorContext is for trusted server code after task-token validation.
+// Callers must never populate it from client-supplied identity headers.
+func SetTaskActorContext(ctx context.Context, actor TaskActor) context.Context {
+	return context.WithValue(ctx, taskActorContextKey{}, actor)
+}
+
 func rejectTemporarilyDisabledUser(w http.ResponseWriter, r *http.Request, userID, email, authPath string) bool {
 	if !auth.IsTemporarilyDisabledUser(userID, email) {
 		return false
@@ -59,6 +82,7 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 			// to convince a downstream handler that its request came
 			// from a non-task-token path.
 			r.Header.Del("X-Actor-Source")
+			r = r.WithContext(SetTaskActorContext(r.Context(), TaskActor{}))
 
 			tokenString, fromCookie := extractToken(r)
 			if tokenString == "" {
@@ -110,6 +134,10 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				// this header is allowed to carry — strip anything else a
 				// client tried to send.
 				r.Header.Set("X-Actor-Source", "task_token")
+				r = r.WithContext(SetTaskActorContext(r.Context(), TaskActor{
+					UserID: userID, AgentID: uuidToString(tt.AgentID),
+					TaskID: uuidToString(tt.TaskID), WorkspaceID: uuidToString(tt.WorkspaceID),
+				}))
 				next.ServeHTTP(w, r)
 				return
 			}

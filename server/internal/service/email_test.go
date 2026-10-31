@@ -3,15 +3,128 @@ package service
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/smtp"
 	"net/textproto"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/resend/resend-go/v2"
 )
+
+type emailProviderTransport func(*http.Request) (*http.Response, error)
+
+func (f emailProviderTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestEmailProviderFailureDoesNotExposeAuthenticationMaterial(t *testing.T) {
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("FRONTEND_ORIGIN", "https://fixture.invalid")
+	for _, provider := range []string{"resend", "smtp"} {
+		t.Run(provider, func(t *testing.T) {
+			for _, kind := range []string{"verification", "invitation"} {
+				t.Run(kind, func(t *testing.T) {
+					secret := "604021"
+					if kind == "invitation" {
+						secret = "synthetic-invitation"
+					}
+					s := &EmailService{fromEmail: "fixture@example.invalid"}
+					if provider == "resend" {
+						s.client = resend.NewCustomClient(&http.Client{Transport: emailProviderTransport(func(r *http.Request) (*http.Response, error) {
+							request, err := io.ReadAll(r.Body)
+							if err != nil {
+								t.Fatal(err)
+							}
+							if !strings.Contains(string(request), secret) {
+								t.Fatal("fixture must reflect material actually sent")
+							}
+							payload, _ := json.Marshal(map[string]string{"message": "rejected body: " + string(request)})
+							return &http.Response{StatusCode: 400, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(payload)))}, nil
+						})}, "synthetic-provider-key")
+					} else {
+						srv, cleanup := startTestSMTPServer(t, testSMTPServer{DataReply: "550 rejected body: " + secret})
+						defer cleanup()
+						s.smtpHost, s.smtpPort, _ = net.SplitHostPort(srv.Addr)
+					}
+					var err error
+					if kind == "verification" {
+						err = s.SendVerificationCode("fixture@example.invalid", secret)
+					} else {
+						err = s.SendInvitationEmail("fixture@example.invalid", "Fixture", "Fixture", secret)
+					}
+					if err == nil {
+						t.Fatal("provider rejection must fail delivery")
+					}
+					if strings.Contains(fmt.Sprintf("%+v", err), secret) || errors.Unwrap(err) != nil {
+						t.Fatal("loggable delivery errors must not retain raw provider diagnostics")
+					}
+				})
+			}
+		})
+	}
+}
+
+func captureEmailFallbackOutput(t *testing.T, run func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stdout
+	func() {
+		os.Stdout = w
+		defer func() { os.Stdout = previous; _ = w.Close() }()
+		run()
+	}()
+	data, err := io.ReadAll(r)
+	_ = r.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func TestEmailDevelopmentFallbackProductionBoundary(t *testing.T) {
+	for _, environment := range []string{"production", " PRODUCTION ", "", "prod", "staging", "test", "developmnt"} {
+		t.Run(environment, func(t *testing.T) {
+			t.Setenv("APP_ENV", environment)
+			t.Setenv("FRONTEND_ORIGIN", "https://fixture.invalid")
+			s := &EmailService{}
+			var verificationErr, invitationErr error
+			output := captureEmailFallbackOutput(t, func() {
+				verificationErr = s.SendVerificationCode("fixture@example.invalid", "604021")
+				invitationErr = s.SendInvitationEmail("fixture@example.invalid", "Fixture", "Fixture", "synthetic-invitation")
+			})
+			if verificationErr == nil || invitationErr == nil {
+				t.Fatal("production delivery without a backend must fail")
+			}
+			if output != "" {
+				t.Fatal("production fallback must not log code, invitation or recipient")
+			}
+			if strings.Contains(verificationErr.Error(), "604021") || strings.Contains(invitationErr.Error(), "synthetic-invitation") {
+				t.Fatal("delivery error must not expose authentication material")
+			}
+		})
+	}
+}
+
+func TestEmailDevelopmentFallbackRemainsLocal(t *testing.T) {
+	t.Setenv("APP_ENV", "development")
+	s := &EmailService{}
+	var deliveryErr error
+	output := captureEmailFallbackOutput(t, func() { deliveryErr = s.SendVerificationCode("fixture@example.invalid", "604021") })
+	if deliveryErr != nil {
+		t.Fatal(deliveryErr)
+	}
+	if !strings.Contains(output, "604021") {
+		t.Fatal("explicit development fallback must remain available")
+	}
+}
 
 type fakeSMTPAuthClient struct {
 	authErrs   []error
@@ -511,6 +624,7 @@ type testSMTPServer struct {
 	ExpectedPass string
 	// If true, advertise STARTTLS in EHLO
 	AdvertiseSTARTTLS bool
+	DataReply         string
 }
 
 func startTestSMTPServer(t *testing.T, cfg testSMTPServer) (*testSMTPServer, func()) {
@@ -622,7 +736,11 @@ func (s *testSMTPServer) handleConn(conn net.Conn) {
 					break
 				}
 			}
-			writeLine("250 OK")
+			if s.DataReply != "" {
+				writeLine("%s", s.DataReply)
+			} else {
+				writeLine("250 OK")
+			}
 
 		case strings.HasPrefix(upper, "STARTTLS"):
 			writeLine("220 Ready to start TLS")

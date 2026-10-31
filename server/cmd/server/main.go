@@ -285,13 +285,17 @@ func main() {
 		slog.Warn("JWT_SECRET is not set — using insecure dev default (allowed only because APP_ENV is not production).")
 	}
 	if os.Getenv("RESEND_API_KEY") == "" && strings.TrimSpace(os.Getenv("SMTP_HOST")) == "" {
-		slog.Warn("no email backend configured (RESEND_API_KEY and SMTP_HOST both empty) — verification codes will be printed to the log instead of emailed.")
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "development") {
+			slog.Warn("no email backend configured (RESEND_API_KEY and SMTP_HOST both empty) — development verification codes will be printed to the log instead of emailed.")
+		} else {
+			slog.Warn("no email backend configured — email delivery is unavailable outside APP_ENV=development; configure RESEND_API_KEY or SMTP_HOST.")
+		}
 	}
 	if os.Getenv("MULTICA_DEV_VERIFICATION_CODE") != "" {
-		if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production") {
-			slog.Warn("MULTICA_DEV_VERIFICATION_CODE is set but ignored because APP_ENV=production.")
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "development") {
+			slog.Warn("MULTICA_DEV_VERIFICATION_CODE is enabled for APP_ENV=development. Use it only for local development or private test instances.")
 		} else {
-			slog.Warn("MULTICA_DEV_VERIFICATION_CODE is enabled. Use it only for local development or private test instances.")
+			slog.Warn("MULTICA_DEV_VERIFICATION_CODE is set but ignored because APP_ENV is not development.")
 		}
 	}
 
@@ -563,10 +567,7 @@ func main() {
 		LLMMaxRetries:       llmMaxRetries,
 	})
 
-	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: r,
-	}
+	srv := newHTTPServer(":"+port, r)
 	profilingServer := profiling.NewServer()
 
 	// Start background workers.

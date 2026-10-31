@@ -59,7 +59,7 @@ func leaderTask(t *testing.T, agentID, issueID string, isLeaderTask bool, squadI
 }
 
 func evaluationRequest(issueID, agentID, taskID, outcome string) *http.Request {
-	return testutil.WithHeaders(
+	req := testutil.WithHeaders(
 		testutil.WithURLParams(
 			newRequest(http.MethodPost, "/api/issues/"+issueID+"/squad-evaluated",
 				map[string]any{"outcome": outcome, "reason": "test reason"}),
@@ -68,6 +68,8 @@ func evaluationRequest(issueID, agentID, taskID, outcome string) *http.Request {
 		"X-Agent-ID", agentID,
 		"X-Task-ID", taskID,
 	)
+	authenticateTaskActorForTest(req)
+	return req
 }
 
 type recordedEvaluation struct {

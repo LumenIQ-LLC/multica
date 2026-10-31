@@ -608,9 +608,8 @@ func (h *Handler) consumePendingGitHubInstallation(ctx context.Context, inst db.
 // placeholder. The next `installation` webhook delivery from GitHub will
 // upsert the row with the real account info — see handleInstallationEvent.
 //
-// The HTTP call is synchronous (no independent timeout — that's a pre-
-// existing wart of the install path), but we deliberately do NOT let a
-// failure abort the setup callback: a network blip here just leaves the
+// The synchronous HTTP call has a bounded deadline. A failure does not abort
+// the setup callback: a network blip here just leaves the
 // "unknown" placeholder in place, and the frontend re-queries on the
 // realtime broadcast emitted by the webhook handler, so the UI converges
 // without a manual refresh.
@@ -632,7 +631,7 @@ func fetchInstallationAccount(ctx context.Context, installationID int64) (login,
 	} else if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doProviderRequest(req)
 	if err != nil {
 		return
 	}
@@ -647,7 +646,7 @@ func fetchInstallationAccount(ctx context.Context, installationID int64) (login,
 			AvatarURL string `json:"avatar_url"`
 		} `json:"account"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := decodeProviderJSON(resp.Body, githubAPIResponseLimit, &body); err != nil {
 		return
 	}
 	if body.Account.Login != "" {
@@ -824,7 +823,7 @@ func fetchGitHubInstallationRepositories(
 		return GitHubRepositoriesResponse{}, errors.New("github App JWT credentials unavailable")
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := providerHTTPClient
 	tokenEndpoint := fmt.Sprintf(
 		"%s/app/installations/%d/access_tokens",
 		strings.TrimRight(githubAPIBase, "/"),
@@ -841,7 +840,7 @@ func fetchGitHubInstallationRepositories(
 	}
 	setGitHubAPIHeaders(tokenReq, appJWT)
 	tokenReq.Header.Set("Content-Type", "application/json")
-	tokenResp, err := client.Do(tokenReq)
+	tokenResp, err := doProviderRequest(tokenReq)
 	if err != nil {
 		return GitHubRepositoriesResponse{}, fmt.Errorf("create installation token: %w", err)
 	}
@@ -853,7 +852,7 @@ func fetchGitHubInstallationRepositories(
 	var tokenBody struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(io.LimitReader(tokenResp.Body, githubAPIResponseLimit)).Decode(&tokenBody); err != nil {
+	if err := decodeProviderJSON(tokenResp.Body, githubAPIResponseLimit, &tokenBody); err != nil {
 		return GitHubRepositoriesResponse{}, fmt.Errorf("decode installation token: %w", err)
 	}
 	if tokenBody.Token == "" {
@@ -872,7 +871,7 @@ func fetchGitHubInstallationRepositories(
 		return GitHubRepositoriesResponse{}, err
 	}
 	setGitHubAPIHeaders(repositoriesReq, tokenBody.Token)
-	repositoriesResp, err := client.Do(repositoriesReq)
+	repositoriesResp, err := doProviderRequest(repositoriesReq)
 	if err != nil {
 		return GitHubRepositoriesResponse{}, fmt.Errorf("list installation repositories: %w", err)
 	}
@@ -894,7 +893,7 @@ func fetchGitHubInstallationRepositories(
 			DefaultBranch string  `json:"default_branch"`
 		} `json:"repositories"`
 	}
-	if err := json.NewDecoder(io.LimitReader(repositoriesResp.Body, githubAPIResponseLimit)).Decode(&body); err != nil {
+	if err := decodeProviderJSON(repositoriesResp.Body, githubAPIResponseLimit, &body); err != nil {
 		return GitHubRepositoriesResponse{}, fmt.Errorf("decode installation repositories: %w", err)
 	}
 	out := GitHubRepositoriesResponse{

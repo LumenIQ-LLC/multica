@@ -866,6 +866,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	}
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
+	var droppedMessages atomic.Int64
 	// Turn control has to follow the attempt that is actually running. A retry
 	// abandons the previous attempt's process entirely, so a control handle
 	// pinned to firstSession would steer or interrupt a turn that no longer
@@ -897,30 +898,39 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			// thread that never produced a turn (MUL-5110). The first non-pin
 			// message means the attempt is live: flush and stream from then on.
 			var heldPins []Message
+			var observedSessionID string
 			holdingPins := true
 			flushHeldPins := func() {
 				for _, held := range heldPins {
-					msgCh <- held
+					relayCodexMessage(msgCh, held, &droppedMessages)
 				}
 				heldPins = nil
 				holdingPins = false
 			}
 			for msg := range session.Messages {
+				if msg.Type == MessageStatus && msg.SessionID != "" {
+					observedSessionID = msg.SessionID
+				}
 				if holdingPins && msg.Type == MessageStatus && msg.Status == "running" {
-					heldPins = append(heldPins, msg)
+					if len(heldPins) > 0 {
+						droppedMessages.Add(1)
+					}
+					heldPins = []Message{msg}
 					continue
 				}
 				if holdingPins {
 					flushHeldPins()
 				}
-				msgCh <- msg
+				relayCodexMessage(msgCh, msg, &droppedMessages)
 			}
 			result, ok := <-session.Result
 			if !ok {
 				flushHeldPins()
-				resCh <- Result{Status: "failed", Error: "codex attempt closed without result"}
+				resCh <- Result{Status: "failed", Error: "codex attempt closed without result", SessionID: observedSessionID}
 				return
 			}
+			droppedMessages.Add(result.DroppedMessages)
+			result.DroppedMessages = 0
 			retryReason := ""
 			switch {
 			case result.codexInitializeRetrySafe:
@@ -929,6 +939,9 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				retryReason = "model_catalog_refresh"
 			}
 			if retryReason == "" || attempt == 2 {
+				if result.SessionID == "" && !result.ResumeRejected {
+					result.SessionID = observedSessionID
+				}
 				flushHeldPins()
 				resCh <- result
 				return
@@ -967,7 +980,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 
 	return &Session{
 		Messages: msgCh,
-		Result:   resCh,
+		Result:   transcriptResult(resCh, &droppedMessages),
 		turnControl: func(ctx context.Context, req TurnControlRequest) (TurnControlResult, error) {
 			return activeSession.Load().ControlTurn(ctx, req)
 		},
@@ -1131,6 +1144,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
+	var droppedMessages atomic.Int64
 	semanticActivityCh := make(chan string, 256)
 
 	var outputMu sync.Mutex
@@ -1177,7 +1191,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			if activity == "status:running" {
 				firstItemWait.start(time.Now())
 			}
-			trySend(msgCh, msg)
+			relayCodexMessage(msgCh, msg, &droppedMessages)
 			trySendString(semanticActivityCh, activity)
 			if activity != "" {
 				semanticObserved.Store(true)
@@ -1809,7 +1823,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh, turnControl: c.controlTurn}, nil
+	return &Session{Messages: msgCh, Result: transcriptResult(resCh, &droppedMessages), turnControl: c.controlTurn}, nil
 }
 
 // The continuity notice this backend prepends is supplied by the caller via

@@ -9,14 +9,13 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/multica-ai/multica/server/internal/auth"
 )
 
-// authRequestWithAgent makes an authenticated request with X-Agent-ID +
-// X-Task-ID headers, causing the server to resolve the actor as an agent
-// instead of a member. resolveActor requires both headers to grant agent
-// identity (defense against header forgery — see #2359 PR review), so we
-// seed a queued task for the agent on demand and pass its UUID as
-// X-Task-ID. The task is best-effort cleaned up via test teardown elsewhere.
+// authRequestWithAgent authenticates through the real task-token middleware.
+// The server derives the agent/task identity from this disposable credential;
+// caller-supplied actor headers cannot establish that identity.
 func authRequestWithAgent(t *testing.T, method, path string, body any, agentID string) *http.Response {
 	t.Helper()
 	var bodyReader io.Reader
@@ -29,10 +28,25 @@ func authRequestWithAgent(t *testing.T, method, path string, body any, agentID s
 		t.Fatalf("failed to create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+testToken)
+	taskID := ensureAgentTask(t, agentID)
+	token, err := auth.GenerateAgentTaskToken()
+	if err != nil {
+		t.Fatalf("generate task token: %v", err)
+	}
+	hash := auth.HashToken(token)
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO task_token (token_hash, task_id, agent_id, workspace_id, user_id, expires_at)
+		VALUES ($1, $2, $3, $4, $5, now() + interval '5 minutes')
+	`, hash, taskID, agentID, testWorkspaceID, testUserID); err != nil {
+		t.Fatalf("create task-token fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(context.Background(), `DELETE FROM task_token WHERE token_hash = $1`, hash); err != nil {
+			t.Errorf("delete task-token fixture: %v", err)
+		}
+	})
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Workspace-ID", testWorkspaceID)
-	req.Header.Set("X-Agent-ID", agentID)
-	req.Header.Set("X-Task-ID", ensureAgentTask(t, agentID))
 
 	r, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -42,9 +56,8 @@ func authRequestWithAgent(t *testing.T, method, path string, body any, agentID s
 }
 
 // ensureAgentTask returns a queued task UUID belonging to the given agent,
-// inserting one if none exists. Used by authRequestWithAgent so callers
-// can keep treating "set X-Agent-ID" as the single knob for posing as an
-// agent — resolveActor's pair-required policy is satisfied transparently.
+// inserting one if none exists. The task is bound into the disposable
+// server-side task-token fixture used by authRequestWithAgent.
 func ensureAgentTask(t *testing.T, agentID string) string {
 	t.Helper()
 	ctx := context.Background()

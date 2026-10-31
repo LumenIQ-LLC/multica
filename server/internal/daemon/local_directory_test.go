@@ -249,11 +249,8 @@ func TestValidateLocalPath(t *testing.T) {
 	})
 
 	t.Run("rejects the user home directory", func(t *testing.T) {
-		home, err := os.UserHomeDir()
-		if err != nil || home == "" {
-			t.Skip("no home dir")
-		}
-		if err := validateLocalPath(home); err == nil {
+		home := t.TempDir()
+		if err := validateLocalPathWithHome(home, home); err == nil {
 			t.Errorf("expected error for $HOME")
 		}
 	})
@@ -291,17 +288,14 @@ func TestValidateLocalPath(t *testing.T) {
 	})
 
 	t.Run("rejects a symlink pointing at the user home", func(t *testing.T) {
-		home, err := os.UserHomeDir()
-		if err != nil || home == "" {
-			t.Skip("no home dir")
-		}
+		home := t.TempDir()
 		link := filepath.Join(dir, "home-link")
 		if err := os.Symlink(home, link); err != nil {
 			t.Fatalf("symlink: %v", err)
 		}
 		// The literal cleaned path is dir/home-link, which is NOT in the
 		// blacklist. Without the realpath check this used to pass.
-		err = validateLocalPath(link)
+		err = validateLocalPathWithHome(link, home)
 		if err == nil {
 			t.Fatal("expected error for symlink pointing at $HOME")
 		}

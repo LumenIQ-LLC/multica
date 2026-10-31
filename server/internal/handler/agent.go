@@ -975,6 +975,10 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 	// invocation allow-list. Targets are batch-loaded to avoid an N+1 and
 	// reused to enrich each response's invocation_targets.
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	if actorType == "agent" && !agentActorBindingAllows(r.Context(), actorID, workspaceID) {
+		writeError(w, http.StatusForbidden, "task credential scope mismatch")
+		return
+	}
 	targetsByAgent, ok := h.loadInvocationTargetsByAgent(r.Context(), agents)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "failed to load agent invocation targets")

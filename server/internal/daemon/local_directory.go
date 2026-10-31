@@ -262,13 +262,21 @@ func resolveRealPath(absPath string) (string, error) {
 // Each failure returns a typed error message so the daemon can forward it
 // onto the task's fail comment verbatim.
 func validateLocalPath(absPath string) error {
+	home, _ := os.UserHomeDir()
+	return validateLocalPathWithHome(absPath, home)
+}
+
+// The explicit home seam keeps filesystem security tests hermetic without
+// changing HOME or requiring a real account directory. Production captures the
+// OS-provided home once and runs these identical checks.
+func validateLocalPathWithHome(absPath, home string) error {
 	if absPath == "" {
 		return errors.New("local_directory: local_path is empty")
 	}
 	if !filepath.IsAbs(absPath) {
 		return fmt.Errorf("local_directory: local_path must be absolute, got %q", absPath)
 	}
-	if reason, blocked := isBlacklistedLocalPath(absPath); blocked {
+	if reason, blocked := isBlacklistedLocalPathWithHome(absPath, home); blocked {
 		return fmt.Errorf("local_directory: %s (%q)", reason, absPath)
 	}
 	info, err := os.Stat(absPath)
@@ -301,7 +309,7 @@ func validateLocalPath(absPath string) error {
 		return fmt.Errorf("local_directory: resolve symlinks for %q: %w", absPath, err)
 	}
 	realPath = filepath.Clean(realPath)
-	if reason, blocked := isBlacklistedRealPath(realPath); blocked {
+	if reason, blocked := isBlacklistedRealPathWithHome(realPath, home); blocked {
 		if realPath != filepath.Clean(absPath) {
 			return fmt.Errorf("local_directory: %s (symlink target of %q is %q)", reason, absPath, realPath)
 		}
@@ -322,6 +330,11 @@ func validateLocalPath(absPath string) error {
 // The check is by literal equality after Clean(), not prefix containment:
 // a legitimate project under /Users/<user>/code/proj should pass.
 func isBlacklistedLocalPath(absPath string) (reason string, blocked bool) {
+	home, _ := os.UserHomeDir()
+	return isBlacklistedLocalPathWithHome(absPath, home)
+}
+
+func isBlacklistedLocalPathWithHome(absPath, home string) (reason string, blocked bool) {
 	cleaned := filepath.Clean(absPath)
 	if isDriveRoot(cleaned) {
 		return fmt.Sprintf("path is a drive root %q", cleaned), true
@@ -331,7 +344,7 @@ func isBlacklistedLocalPath(absPath string) (reason string, blocked bool) {
 			return fmt.Sprintf("path is a protected system root %q", banned), true
 		}
 	}
-	if home, err := os.UserHomeDir(); err == nil {
+	if home != "" {
 		if cleaned == filepath.Clean(home) {
 			return "path is the user's home directory", true
 		}
@@ -348,6 +361,11 @@ func isBlacklistedLocalPath(absPath string) (reason string, blocked bool) {
 // (~/proj/home-link -> /Users/me) or by directly typing the canonical form
 // (/private/tmp), which is identical to the OS view of /tmp.
 func isBlacklistedRealPath(realPath string) (reason string, blocked bool) {
+	home, _ := os.UserHomeDir()
+	return isBlacklistedRealPathWithHome(realPath, home)
+}
+
+func isBlacklistedRealPathWithHome(realPath, home string) (reason string, blocked bool) {
 	realClean := filepath.Clean(realPath)
 	if isDriveRoot(realClean) {
 		return fmt.Sprintf("path is a drive root %q", realClean), true
@@ -363,7 +381,7 @@ func isBlacklistedRealPath(realPath string) (reason string, blocked bool) {
 			}
 		}
 	}
-	if home, err := os.UserHomeDir(); err == nil {
+	if home != "" {
 		homeClean := filepath.Clean(home)
 		if realClean == homeClean {
 			return "path is the user's home directory", true

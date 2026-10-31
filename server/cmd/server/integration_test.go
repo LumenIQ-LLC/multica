@@ -41,6 +41,21 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	// These database-backed HTTP tests use the explicit local no-send email
+	// path. Never inherit a real provider or enable the fixed development code:
+	// the authentication tests must still redeem the generated database code.
+	for key, value := range map[string]string{
+		"APP_ENV":                       "development",
+		"RESEND_API_KEY":                "",
+		"SMTP_HOST":                     "",
+		"MULTICA_DEV_VERIFICATION_CODE": "",
+	} {
+		if err := os.Setenv(key, value); err != nil {
+			fmt.Printf("Failed to configure local email fixture %s: %v\n", key, err)
+			os.Exit(1)
+		}
+	}
+
 	ctx := context.Background()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {

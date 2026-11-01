@@ -295,7 +295,7 @@ func TestValidateLocalPath(t *testing.T) {
 		}
 		// The literal cleaned path is dir/home-link, which is NOT in the
 		// blacklist. Without the realpath check this used to pass.
-		err = validateLocalPathWithHome(link, home)
+		err := validateLocalPathWithHome(link, home)
 		if err == nil {
 			t.Fatal("expected error for symlink pointing at $HOME")
 		}

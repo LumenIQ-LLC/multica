@@ -183,7 +183,7 @@ describe("type scale", () => {
 
     for (const root of scanRoots) {
       for (const path of collectSourceFiles(resolve(repoRoot, root))) {
-        const rel = relative(repoRoot, path);
+        const rel = relative(repoRoot, path).replaceAll("\\", "/");
         const lines = stripComments(readFileSync(path, "utf8")).split("\n");
         lines.forEach((line, index) => {
           for (const { label, regex, hint, appliesTo } of bannedPatterns) {

@@ -30,6 +30,18 @@ func TestMain(m *testing.M) {
 	case "startup_stdout_burst":
 		runFakeClaudeStartupStdoutBurst()
 		os.Exit(0)
+	case "codex_transcript_overflow":
+		runFakeCodexTranscriptOverflow()
+		os.Exit(0)
+	case "transcript_overflow":
+		for range 600 {
+			fmt.Println(`{"type":"log","log":{"level":"info","message":"fixture"}}`)
+		}
+		if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
+			os.Exit(13)
+		}
+		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"session_id":"fixture-overflow","result":"done"}`)
+		os.Exit(0)
 	case "control_request":
 		runFakeClaudeControlRequest()
 		os.Exit(0)

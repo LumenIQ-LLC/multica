@@ -70,7 +70,7 @@ func assistantMessageForTask(t *testing.T, taskID string) (id, content string, o
 
 // doUpload performs a multipart upload of a task_id form field with the given
 // request headers, and returns the recorder.
-func doUpload(t *testing.T, formTaskID string, headers map[string]string) *httptest.ResponseRecorder {
+func doUpload(t *testing.T, formTaskID string, headers map[string]string, trustedTask ...bool) *httptest.ResponseRecorder {
 	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -88,6 +88,9 @@ func doUpload(t *testing.T, formTaskID string, headers map[string]string) *httpt
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	for k, v := range headers {
 		req.Header.Set(k, v)
+	}
+	if len(trustedTask) > 0 && trustedTask[0] {
+		authenticateTaskActorForTest(req)
 	}
 	w := httptest.NewRecorder()
 	testHandler.UploadFile(w, req)
@@ -114,7 +117,7 @@ func uploadWithTaskID(t *testing.T, agentID, actorTaskID, formTaskID string) *ht
 	if actorTaskID != "" {
 		headers["X-Task-ID"] = actorTaskID
 	}
-	return doUpload(t, formTaskID, headers)
+	return doUpload(t, formTaskID, headers, agentID != "")
 }
 
 // TestUploadFile_TaskScopedChatAttachment covers the write side: an agent

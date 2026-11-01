@@ -138,6 +138,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
+	var droppedMessages atomic.Int64
 
 	// procDone closes once cmd.Wait() returns, letting the cancellation handler
 	// skip a process that already exited and avoid signalling a dead/reused pid.
@@ -240,14 +241,14 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			switch msg.Type {
 			case "assistant":
 				assistantEventCount++
-				turn := b.handleAssistant(msg, msgCh, usage)
+				turn := b.handleAssistant(msg, msgCh, usage, &droppedMessages)
 				toolUseCount += turn.toolUses
 				if !turn.understood {
 					unreadableAssistantCount++
 				}
 				lastAssistantText = turn.resolveFallback(lastAssistantText)
 			case "user":
-				if b.handleUser(msg, msgCh) {
+				if b.handleUser(msg, msgCh, &droppedMessages) {
 					sawAsyncLaunch = true
 				}
 			case "system":
@@ -257,7 +258,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					// id IS the turn id for control purposes.
 					control.beginTurn(msg.SessionID)
 				}
-				trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
+				trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID}, &droppedMessages)
 			case "result":
 				modelInventory = claudeObservedModelInventory(msg)
 				sawResult = true
@@ -290,7 +291,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 						Type:    MessageLog,
 						Level:   msg.Log.Level,
 						Content: msg.Log.Message,
-					})
+					}, &droppedMessages)
 				}
 			case "control_request":
 				b.handleControlRequest(msg, stdin)
@@ -395,10 +396,10 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh, turnControl: control.controlTurn}, nil
+	return &Session{Messages: msgCh, Result: transcriptResult(resCh, &droppedMessages), turnControl: control.controlTurn}, nil
 }
 
-func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message, usage map[string]TokenUsage) assistantTurn {
+func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message, usage map[string]TokenUsage, dropped ...*atomic.Int64) assistantTurn {
 	var content claudeMessageContent
 	if err := json.Unmarshal(msg.Message, &content); err != nil {
 		// Unreadable body: understood stays false so the caller drops any
@@ -424,11 +425,11 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 		case "text":
 			if block.Text != "" {
 				assistantText.WriteString(block.Text)
-				trySend(ch, Message{Type: MessageText, Content: block.Text})
+				trySend(ch, Message{Type: MessageText, Content: block.Text}, dropped...)
 			}
 		case "thinking":
 			if block.Text != "" {
-				trySend(ch, Message{Type: MessageThinking, Content: block.Text})
+				trySend(ch, Message{Type: MessageThinking, Content: block.Text}, dropped...)
 			}
 		case "tool_use":
 			toolUseCount++
@@ -441,7 +442,7 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 				Tool:   block.Name,
 				CallID: block.ID,
 				Input:  input,
-			})
+			}, dropped...)
 		default:
 			// A block type we do not render may be carrying the model's answer
 			// in a shape we cannot read, so we must not claim this turn was
@@ -455,7 +456,7 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 	return turn
 }
 
-func (b *claudeBackend) handleUser(msg claudeSDKMessage, ch chan<- Message) bool {
+func (b *claudeBackend) handleUser(msg claudeSDKMessage, ch chan<- Message, dropped ...*atomic.Int64) bool {
 	var content claudeMessageContent
 	if err := json.Unmarshal(msg.Message, &content); err != nil {
 		return false
@@ -475,7 +476,7 @@ func (b *claudeBackend) handleUser(msg claudeSDKMessage, ch chan<- Message) bool
 				Type:   MessageToolResult,
 				CallID: block.ToolUseID,
 				Output: resultStr,
-			})
+			}, dropped...)
 		}
 	}
 	return sawAsyncLaunch
@@ -719,12 +720,13 @@ type claudeControlRequestPayload struct {
 
 // ── Shared helpers ──
 
-func trySend(ch chan<- Message, msg Message) {
+func trySend(ch chan<- Message, msg Message, dropped ...*atomic.Int64) {
 	select {
 	case ch <- msg:
 	default:
-		// Channel full — drop message. Result.Output is finalized independently,
-		// so only live transcript consumers are affected.
+		for _, counter := range dropped {
+			counter.Add(1)
+		}
 	}
 }
 

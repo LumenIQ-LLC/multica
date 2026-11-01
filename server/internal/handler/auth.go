@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -121,7 +120,7 @@ func generateCode() (string, error) {
 }
 
 func isDevVerificationCode(code string) bool {
-	if isProductionEnv() {
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "development") {
 		return false
 	}
 
@@ -131,10 +130,6 @@ func isDevVerificationCode(code string) bool {
 	}
 
 	return subtle.ConstantTimeCompare([]byte(code), []byte(devCode)) == 1
-}
-
-func isProductionEnv() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production")
 }
 
 func isSixDigitCode(code string) bool {
@@ -384,21 +379,12 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dbCode, err := h.Queries.GetLatestVerificationCode(r.Context(), email)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid or expired code")
-		return
-	}
-
-	isDevCode := isDevVerificationCode(code)
-	if !isDevCode && subtle.ConstantTimeCompare([]byte(code), []byte(dbCode.Code)) != 1 {
-		_ = h.Queries.IncrementVerificationCodeAttempts(r.Context(), dbCode.ID)
-		writeError(w, http.StatusBadRequest, "invalid or expired code")
-		return
-	}
-
-	if err := h.Queries.MarkVerificationCodeUsed(r.Context(), dbCode.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to verify code")
+	if err := h.consumeVerificationCode(r.Context(), email, code); err != nil {
+		if errors.Is(err, errInvalidVerificationCode) {
+			writeError(w, http.StatusBadRequest, "invalid or expired code")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to verify code")
+		}
 		return
 	}
 
@@ -448,6 +434,60 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 		Token: tokenString,
 		User:  h.userToResponse(user),
 	})
+}
+
+var errInvalidVerificationCode = errors.New("invalid or expired verification code")
+
+// Serialize validation and consumption across replicas. The newest code stays
+// authoritative after consumption/exhaustion; an older code cannot reappear.
+func (h *Handler) consumeVerificationCode(ctx context.Context, email, code string) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if h.TxStarter == nil {
+		return errors.New("verification storage unavailable")
+	}
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), time.Second)
+		defer rollbackCancel()
+		_ = tx.Rollback(rollbackCtx)
+	}()
+	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended('verification_code:' || $1, 0))", email); err != nil {
+		return err
+	}
+	queries := h.Queries.WithTx(tx)
+	dbCode, err := queries.GetLatestCodeByEmail(ctx, email)
+	if err != nil {
+		if isNotFound(err) {
+			return errInvalidVerificationCode
+		}
+		return err
+	}
+	if dbCode.Used || dbCode.Attempts >= 5 || !dbCode.ExpiresAt.Valid || !dbCode.ExpiresAt.Time.After(time.Now()) {
+		return errInvalidVerificationCode
+	}
+	valid := isDevVerificationCode(code) || subtle.ConstantTimeCompare([]byte(code), []byte(dbCode.Code)) == 1
+	statement := "UPDATE verification_code SET attempts = attempts + 1 WHERE id = $1 AND used = FALSE AND attempts < 5 AND expires_at > now()"
+	if valid {
+		statement = "UPDATE verification_code SET used = TRUE WHERE id = $1 AND used = FALSE AND attempts < 5 AND expires_at > now()"
+	}
+	updated, err := tx.Exec(ctx, statement, dbCode.ID)
+	if err != nil {
+		return err
+	}
+	if updated.RowsAffected() != 1 {
+		return errInvalidVerificationCode
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	if !valid {
+		return errInvalidVerificationCode
+	}
+	return nil
 }
 
 func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
@@ -516,13 +556,19 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Exchange authorization code for tokens.
-	tokenResp, err := http.PostForm("https://oauth2.googleapis.com/token", url.Values{
+	tokenReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(url.Values{
 		"code":          {req.Code},
 		"client_id":     {clientID},
 		"client_secret": {clientSecret},
 		"redirect_uri":  {redirectURI},
 		"grant_type":    {"authorization_code"},
-	})
+	}.Encode()))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create token request")
+		return
+	}
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenResp, err := doProviderRequest(tokenReq)
 	if err != nil {
 		slog.Error("google oauth token exchange failed", "error", err)
 		writeError(w, http.StatusBadGateway, "failed to exchange code with Google")
@@ -530,20 +576,13 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tokenResp.Body.Close()
 
-	tokenBody, err := io.ReadAll(tokenResp.Body)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "failed to read Google token response")
-		return
-	}
-
 	if tokenResp.StatusCode != http.StatusOK {
-		slog.Error("google oauth token exchange returned error", "status", tokenResp.StatusCode, "body", string(tokenBody))
+		slog.Error("google oauth token exchange returned error", "status", tokenResp.StatusCode)
 		writeError(w, http.StatusBadRequest, "failed to exchange code with Google")
 		return
 	}
-
 	var gToken googleTokenResponse
-	if err := json.Unmarshal(tokenBody, &gToken); err != nil {
+	if err := decodeProviderJSON(tokenResp.Body, 1<<20, &gToken); err != nil {
 		writeError(w, http.StatusBadGateway, "failed to parse Google token response")
 		return
 	}
@@ -557,7 +596,7 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	userInfoReq.Header.Set("Authorization", "Bearer "+gToken.AccessToken)
 
-	userInfoResp, err := http.DefaultClient.Do(userInfoReq)
+	userInfoResp, err := doProviderRequest(userInfoReq)
 	if err != nil {
 		slog.Error("google userinfo fetch failed", "error", err)
 		writeError(w, http.StatusBadGateway, "failed to fetch user info from Google")

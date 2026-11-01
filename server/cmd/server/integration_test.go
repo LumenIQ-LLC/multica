@@ -41,6 +41,21 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	// These database-backed HTTP tests use the explicit local no-send email
+	// path. Never inherit a real provider or enable the fixed development code:
+	// the authentication tests must still redeem the generated database code.
+	for key, value := range map[string]string{
+		"APP_ENV":                       "development",
+		"RESEND_API_KEY":                "",
+		"SMTP_HOST":                     "",
+		"MULTICA_DEV_VERIFICATION_CODE": "",
+	} {
+		if err := os.Setenv(key, value); err != nil {
+			fmt.Printf("Failed to configure local email fixture %s: %v\n", key, err)
+			os.Exit(1)
+		}
+	}
+
 	ctx := context.Background()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -246,8 +261,10 @@ func TestReadinessEndpoints(t *testing.T) {
 			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 				t.Fatalf("decode response: %v", err)
 			}
-			if result.Status != "ok" {
-				t.Fatalf("expected status ok, got %s", result.Status)
+			// The integration server deliberately has no Redis: it remains
+			// available with the finite local auth budget, explicitly degraded.
+			if result.Status != "degraded" || result.Checks["auth_rate_limit"] != "local_per_instance" {
+				t.Fatalf("expected degraded local auth mode, got status=%s checks=%v", result.Status, result.Checks)
 			}
 			if result.Checks["db"] != "ok" {
 				t.Fatalf("expected db check ok, got %s", result.Checks["db"])

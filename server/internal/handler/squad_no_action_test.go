@@ -69,6 +69,8 @@ func recordSquadLeaderEvaluationForTaskWithHeader(t *testing.T, fx runningSquadL
 	r.Header.Set("X-Agent-ID", fx.LeaderID)
 	r.Header.Set("X-Task-ID", taskIDHeader)
 
+	authenticateTaskActorForTest(r)
+
 	testHandler.RecordSquadLeaderEvaluation(w, r)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("RecordSquadLeaderEvaluation: expected 201, got %d: %s", w.Code, w.Body.String())
@@ -165,6 +167,8 @@ func TestCreateComment_SquadLeaderNoActionRejectsComment(t *testing.T) {
 	r = withURLParam(r, "id", fx.IssueID)
 	r.Header.Set("X-Agent-ID", fx.LeaderID)
 	r.Header.Set("X-Task-ID", fx.TaskID)
+
+	authenticateTaskActorForTest(r)
 
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusConflict {

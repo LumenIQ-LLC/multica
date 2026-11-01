@@ -246,6 +246,8 @@ func TestAgentEnv_AgentActorRejectedForOwnedAgent(t *testing.T) {
 			req := withURLParam(newRequestAs(ownerUserID, method, "/api/agents/"+targetID+"/env", tc.body), "id", targetID)
 			req.Header.Set("X-Agent-ID", hostAgentID)
 			req.Header.Set("X-Task-ID", hostTaskID)
+
+			authenticateTaskActorForTest(req)
 			w := httptest.NewRecorder()
 			tc.fn(w, req)
 			if w.Code != http.StatusForbidden {

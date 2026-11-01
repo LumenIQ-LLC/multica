@@ -404,8 +404,10 @@ its own database and CLI profile, is one command:
 make up C=api,web,daemon
 ```
 
-It creates the environment if needed, sets the fixed local verification code
-before the first launch, logs in as `dev@localhost`, mints a personal access
+It creates a new local environment with `APP_ENV=development` if needed and sets
+its fixed local verification code before the first launch. Existing environment
+files must explicitly select `APP_ENV=development`; other modes are refused
+without changing the file. It logs in as `dev@localhost`, mints a personal access
 token, creates a workspace, writes the CLI profile, builds `server/bin/multica`
 and starts the daemon from that binary. It then prints the URL, the login, the
 commit, and the stop command.

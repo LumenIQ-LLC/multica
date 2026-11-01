@@ -200,13 +200,18 @@ const CostUSDTicksPerUSD = 10_000_000_000
 
 // Result is the final outcome after an agent session completes.
 type Result struct {
-	ModelInventory *ModelInventory // nil for backends without observed provider inventory
-	Status         string          // "completed", "failed", "aborted", "timeout", "cancelled"
-	Output         string          // final user-facing output selected by the backend
-	Error          string          // error message if failed
-	DurationMs     int64
-	SessionID      string
-	Usage          map[string]TokenUsage // keyed by model name
+	// TranscriptDeliveryChecked distinguishes instrumented backends from those
+	// whose delivery completeness is unknown. A complete final answer does not
+	// imply a complete transcript.
+	TranscriptDeliveryChecked bool
+	DroppedMessages           int64
+	ModelInventory            *ModelInventory // nil for backends without observed provider inventory
+	Status                    string          // "completed", "failed", "aborted", "timeout", "cancelled"
+	Output                    string          // final user-facing output selected by the backend
+	Error                     string          // error message if failed
+	DurationMs                int64
+	SessionID                 string
+	Usage                     map[string]TokenUsage // keyed by model name
 	// ResumeRejected is positive evidence that this run's requested resume
 	// was itself refused — the transcript is gone, the session belongs to
 	// another provider account, OR the session still exists but its history

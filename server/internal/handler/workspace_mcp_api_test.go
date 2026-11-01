@@ -203,6 +203,8 @@ func TestCreateWorkspaceMcpServer_DeniesAgentActor(t *testing.T) {
 		req.Header.Set("X-Actor-Source", "task_token")
 		req.Header.Set("X-Agent-ID", caller)
 		req.Header.Set("X-Task-ID", taskID)
+
+		authenticateTaskActorForTest(req)
 	})
 	if code != http.StatusForbidden {
 		t.Fatalf("expected 403 for an agent actor, got %d: %s", code, raw)
@@ -413,6 +415,8 @@ func TestAgentMcpServerBinding_ResponseIsSecretFreeAndAgentActorsCannotWrite(t *
 	req.Header.Set("X-Actor-Source", "task_token")
 	req.Header.Set("X-Agent-ID", agentID)
 	req.Header.Set("X-Task-ID", taskID)
+
+	authenticateTaskActorForTest(req)
 	w = httptest.NewRecorder()
 	testHandler.AddAgentMcpServer(w, req)
 	if w.Code != http.StatusForbidden {

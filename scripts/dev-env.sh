@@ -320,7 +320,15 @@ load_env_file() {
 # once. Setting it here removes the start → edit → restart detour, and is what
 # makes `up` able to log itself in without a human reading a log for a code.
 ensure_dev_code() {
-  local file="$REPO_ROOT/$1" tmp
+  local file="$REPO_ROOT/$1" tmp app_env
+  # Inspect the selected file without executing it or mutating existing modes.
+  # Last assignment wins, matching load_env_file. Only explicit development
+  # can opt into the local fixed-code shortcut.
+  app_env="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?APP_ENV[[:space:]]*=[[:space:]]*(.*)$/\2/p' "$file" | tail -n 1 | sed 's/[[:space:]]*$//')"
+  case "$app_env" in
+    development|'"development"'|"'development'") ;;
+    *) die "Fixed local verification codes require APP_ENV=development in $1; environment left unchanged." ;;
+  esac
   if grep -qE '^MULTICA_DEV_VERIFICATION_CODE=[0-9]{6}$' "$file"; then
     return 0
   fi
@@ -331,7 +339,7 @@ ensure_dev_code() {
   else
     printf '\nMULTICA_DEV_VERIFICATION_CODE=%s\n' "$DEV_CODE_DEFAULT" >> "$file"
   fi
-  info "Set MULTICA_DEV_VERIFICATION_CODE=$DEV_CODE_DEFAULT in $1 (ignored when APP_ENV=production)."
+  info "Set MULTICA_DEV_VERIFICATION_CODE=$DEV_CODE_DEFAULT in $1 (requires APP_ENV=development)."
 }
 
 rewrite_env_ports() {
@@ -617,7 +625,7 @@ ensure_credentials() {
 
   curl -sf -X POST "$server/auth/send-code" -H 'Content-Type: application/json' \
     -d "{\"email\":\"${DEV_EMAIL}\"}" >/dev/null \
-    || die "send-code failed. Is MULTICA_DEV_VERIFICATION_CODE set and APP_ENV non-production?"
+    || die "send-code failed. Is MULTICA_DEV_VERIFICATION_CODE set and APP_ENV=development?"
 
   verify="$(curl -sS -X POST "$server/auth/verify-code" -H 'Content-Type: application/json' \
     -d "{\"email\":\"${DEV_EMAIL}\",\"code\":\"${code}\"}")"
@@ -1104,7 +1112,9 @@ Start the rest with 'make up C=api,web', or run 'make up C=daemon' from your own
     if [ "$ENV_FILE" = .env.worktree ]; then
       bash "$REPO_ROOT/scripts/init-worktree-env.sh" "$ENV_FILE" >/dev/null
     else
-      cp "$REPO_ROOT/.env.example" "$REPO_ROOT/$ENV_FILE"
+      # A newly created local environment explicitly opts in. Never rewrite
+      # the mode of an existing environment file.
+      sed 's/^APP_ENV=.*/APP_ENV=development/' "$REPO_ROOT/.env.example" > "$REPO_ROOT/$ENV_FILE"
     fi
     info "Created $ENV_FILE"
   fi

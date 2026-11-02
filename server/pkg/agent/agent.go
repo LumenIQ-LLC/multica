@@ -170,9 +170,12 @@ type Message struct {
 	CallID    string         // tool call ID (ToolUse, ToolResult)
 	Input     map[string]any // tool input (ToolUse)
 	Output    string         // tool output (ToolResult)
-	Status    string         // agent status string (Status)
+	Status    string         // agent status (Status) or provider command status (ToolResult)
 	Level     string         // log level (Log)
 	SessionID string         // backend session id (Status), for early resume-pointer pinning
+	// ExitCode is present only when the provider supplied an integral command result.
+	// A missing result stays unknown; an explicit zero must survive JSON serialization.
+	ExitCode *int `json:"ExitCode,omitempty"`
 }
 
 // TokenUsage tracks token consumption for a single model.

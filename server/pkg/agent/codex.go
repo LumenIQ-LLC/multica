@@ -3366,12 +3366,20 @@ func (c *codexClient) handleItemNotification(method string, params map[string]an
 
 	case method == "item/completed" && itemType == "commandExecution":
 		output, _ := item["aggregatedOutput"].(string)
+		status, _ := item["status"].(string)
+		var exitCode *int
+		if code, ok := item["exitCode"].(float64); ok && code >= -(1<<31) && code <= (1<<31)-1 && code == float64(int(code)) {
+			value := int(code)
+			exitCode = &value
+		}
 		if c.onMessage != nil {
 			c.onMessage(Message{
-				Type:   MessageToolResult,
-				Tool:   "exec_command",
-				CallID: itemID,
-				Output: output,
+				Type:     MessageToolResult,
+				Tool:     "exec_command",
+				CallID:   itemID,
+				Output:   output,
+				Status:   status,
+				ExitCode: exitCode,
 			})
 		}
 

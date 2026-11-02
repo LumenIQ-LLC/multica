@@ -1230,6 +1230,68 @@ func TestCodexRawItemCommandExecution(t *testing.T) {
 	}
 }
 
+func TestCodexRawItemCommandCompletionResult(t *testing.T) {
+	t.Parallel()
+
+	zero, failed := 0, 7
+	cases := []struct {
+		name       string
+		fields     string
+		wantStatus string
+		wantExit   *int
+	}{
+		{name: "successful zero", fields: `,"status":"completed","exitCode":0`, wantStatus: "completed", wantExit: &zero},
+		{name: "failed nonzero", fields: `,"status":"failed","exitCode":7`, wantStatus: "failed", wantExit: &failed},
+		{name: "missing result", fields: `,"status":"completed"`, wantStatus: "completed"},
+		{name: "null result", fields: `,"status":"completed","exitCode":null`, wantStatus: "completed"},
+		{name: "incomplete result", fields: `,"status":"inProgress","exitCode":null`, wantStatus: "inProgress"},
+		{name: "incomplete status retained", fields: `,"status":"inProgress","exitCode":0`, wantStatus: "inProgress", wantExit: &zero},
+		{name: "missing status", fields: `,"exitCode":0`, wantExit: &zero},
+		{name: "fractional result", fields: `,"status":"completed","exitCode":0.5`, wantStatus: "completed"},
+		{name: "string result", fields: `,"status":"completed","exitCode":"0"`, wantStatus: "completed"},
+		{name: "out of range result", fields: `,"status":"completed","exitCode":2147483648`, wantStatus: "completed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, _, _ := newTestCodexClient(t)
+			c.notificationProtocol = "raw"
+			var messages []Message
+			c.onMessage = func(msg Message) { messages = append(messages, msg) }
+			c.handleLine(`{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"commandExecution","id":"command-result","aggregatedOutput":"command output"` + tc.fields + `}}}`)
+			if len(messages) != 1 {
+				t.Fatalf("got %d messages, want one command result", len(messages))
+			}
+			got := messages[0]
+			if got.Type != MessageToolResult || got.Tool != "exec_command" || got.CallID != "command-result" || got.Output != "command output" || got.Status != tc.wantStatus {
+				t.Fatalf("command result changed or lost its completion status: %+v", got)
+			}
+			if (got.ExitCode == nil) != (tc.wantExit == nil) || (got.ExitCode != nil && *got.ExitCode != *tc.wantExit) {
+				t.Fatalf("exit code = %v, want %v", got.ExitCode, tc.wantExit)
+			}
+			data, err := json.Marshal(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire map[string]json.RawMessage
+			if err := json.Unmarshal(data, &wire); err != nil {
+				t.Fatal(err)
+			}
+			rawExit, present := wire["ExitCode"]
+			if tc.wantExit == nil {
+				if present {
+					t.Fatalf("unknown result serialized as an exit code: %s", data)
+				}
+			} else {
+				var wireExit int
+				if !present || json.Unmarshal(rawExit, &wireExit) != nil || wireExit != *tc.wantExit {
+					t.Fatalf("provided exit code did not survive serialization: %s", data)
+				}
+			}
+		})
+	}
+}
+
 func TestCodexRawItemMCPToolCall(t *testing.T) {
 	t.Parallel()
 

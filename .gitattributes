@@ -4,3 +4,7 @@ docker/entrypoint.sh text eol=lf
 
 # Default behavior
 * text=auto
+
+# Keep runtime loaders and the agent guard consistent on Windows checkouts.
+apps/desktop/scripts/package.mjs text eol=lf
+scripts/agent-cli-command-names.txt text eol=lf

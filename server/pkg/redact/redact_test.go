@@ -212,6 +212,28 @@ func TestRedactHomeDirectory(t *testing.T) {
 	}
 }
 
+func TestRedactHomeDirectoryFixtures(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, home, userName, want string
+	}{
+		{"normal account", "/home/fixture", "fixture", "Reading /home/****/Documents/secret.txt"},
+		{"nonstandard account home", "/nonexistent", "nobody", "Reading ****/Documents/secret.txt"},
+		{"unavailable account name", "/srv/private-account", "", "Reading ****/Documents/secret.txt"},
+		{"unknown home", "", "fixture", "Reading /Documents/secret.txt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := redactHomeDirectory("Reading "+tc.home+"/Documents/secret.txt", tc.home, tc.userName)
+			if got != tc.want {
+				t.Fatalf("redact home: got %q, want %q", got, tc.want)
+			}
+			if tc.home != "" && strings.Contains(got, tc.home) {
+				t.Fatal("known home prefix was not redacted")
+			}
+		})
+	}
+}
 func TestNoFalsePositivesOnNormalText(t *testing.T) {
 	t.Parallel()
 	inputs := []string{

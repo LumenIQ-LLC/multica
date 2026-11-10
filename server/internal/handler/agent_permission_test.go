@@ -443,7 +443,7 @@ func TestCanInvokeAgent_SystemWorkspaceExceptionAndMemberFailClosed(t *testing.T
 	if !testHandler.canInvokeAgent(ctx, wsAgent, "system", "", "", testWorkspaceID) {
 		t.Errorf("system trigger should hit a workspace target (product-approved exception)")
 	}
-	if !testHandler.canInvokeAgent(ctx, wsAgent, "agent", "", "", testWorkspaceID) {
+	if !testHandler.canInvokeAgent(ctx, wsAgent, "agent", wsAgentID, "", testWorkspaceID) {
 		t.Errorf("agent trigger with no originator should still hit a workspace target")
 	}
 
@@ -460,11 +460,11 @@ func TestCanInvokeAgent_SystemWorkspaceExceptionAndMemberFailClosed(t *testing.T
 	if testHandler.canInvokeAgent(ctx, memAgent, "system", "", "", testWorkspaceID) {
 		t.Errorf("system trigger must FAIL CLOSED against a member target with no originator")
 	}
-	if testHandler.canInvokeAgent(ctx, memAgent, "agent", "", "", testWorkspaceID) {
+	if testHandler.canInvokeAgent(ctx, memAgent, "agent", memAgentID, "", testWorkspaceID) {
 		t.Errorf("agent trigger with no originator must FAIL CLOSED against a member target")
 	}
 	// But the actual member (as originator) is admitted.
-	if !testHandler.canInvokeAgent(ctx, memAgent, "agent", "", memberX, testWorkspaceID) {
+	if !testHandler.canInvokeAgent(ctx, memAgent, "agent", memAgentID, memberX, testWorkspaceID) {
 		t.Errorf("agent trigger whose originator IS the targeted member should be admitted")
 	}
 }

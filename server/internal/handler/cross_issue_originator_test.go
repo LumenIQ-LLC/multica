@@ -174,7 +174,9 @@ func agentCreatesSubIssue(t *testing.T, agentID, taskID, parentIssueID, targetAg
 // confused-deputy shape the gate must judge by the chain's human, not the caller's
 // session.
 func asRun(req *http.Request, agentID, taskID string) *http.Request {
-	return testutil.WithHeaders(req, "X-Agent-ID", agentID, "X-Task-ID", taskID)
+	req = testutil.WithHeaders(req, "X-Agent-ID", agentID, "X-Task-ID", taskID)
+	authenticateTaskActorForTest(req)
+	return req
 }
 
 // ---- reads ----------------------------------------------------------------

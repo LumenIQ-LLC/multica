@@ -52,7 +52,7 @@ function sourceFiles(subdirs: string[]): { path: string; text: string }[] {
   return subdirs
     .flatMap((d) => walk(join(VIEWS_ROOT, d)))
     .map((path) => ({
-      path: relative(VIEWS_ROOT, path),
+      path: relative(VIEWS_ROOT, path).replaceAll("\\", "/"),
       text: stripComments(readFileSync(path, "utf8")),
     }));
 }

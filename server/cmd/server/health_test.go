@@ -11,7 +11,21 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/multica-ai/multica/server/internal/middleware"
 )
+
+func TestReadinessReportsLocalAuthenticationBudget(t *testing.T) {
+	h := &serverHealth{authRateLimitMode: middleware.NewRateLimitHealth(false).Mode}
+	rec := httptest.NewRecorder()
+	h.readyHandler(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	var response readinessResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Checks.AuthRateLimit != "local_per_instance" {
+		t.Fatalf("mode=%q", response.Checks.AuthRateLimit)
+	}
+}
 
 type stubReadinessDB struct {
 	pingErr      error
@@ -19,6 +33,26 @@ type stubReadinessDB struct {
 	appliedCount int
 	pingCalls    atomic.Int32
 	queryCalls   atomic.Int32
+}
+
+func TestReadinessRetainsAvailabilityWithExplicitFiniteLocalAuthMode(t *testing.T) {
+	for _, mode := range []string{"local_per_instance", "redis_with_local_guard"} {
+		h := &serverHealth{db: &stubReadinessDB{appliedCount: 1}, requiredMigrations: []string{"001_init"},
+			authRateLimitMode: func() string { return mode }}
+		rec := httptest.NewRecorder()
+		h.readyHandler(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		var response readinessResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		want := "ok"
+		if mode == "local_per_instance" {
+			want = "degraded"
+		}
+		if rec.Code != http.StatusOK || response.Status != want || response.Checks.AuthRateLimit != mode {
+			t.Fatalf("mode=%s status=%d body=%+v", mode, rec.Code, response)
+		}
+	}
 }
 
 func (s *stubReadinessDB) Ping(context.Context) error {

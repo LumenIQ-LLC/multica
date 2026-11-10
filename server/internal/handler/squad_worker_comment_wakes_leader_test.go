@@ -79,6 +79,8 @@ func TestCreateComment_WorkerAgentCommentWakesSquadLeader_MUL4015(t *testing.T) 
 	})
 	r.Header.Set("X-Agent-ID", fx.OtherID)
 	r.Header.Set("X-Task-ID", workerTaskID)
+
+	authenticateTaskActorForTest(r)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
@@ -153,6 +155,8 @@ func TestCreateComment_WorkerAgentCommentDoesNotWakeLeader_WhenLeaderTaskPending
 	})
 	r.Header.Set("X-Agent-ID", fx.OtherID)
 	r.Header.Set("X-Task-ID", workerTaskID)
+
+	authenticateTaskActorForTest(r)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
@@ -284,6 +288,8 @@ func TestCreateComment_WorkerAgentCommentWakesPrivateSquadLeader_MUL4015(t *test
 	})
 	r.Header.Set("X-Agent-ID", leaderID)
 	r.Header.Set("X-Task-ID", leaderTaskID)
+
+	authenticateTaskActorForTest(r)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
@@ -339,6 +345,8 @@ func TestCreateComment_WorkerAgentCommentWakesPrivateSquadLeader_MUL4015(t *test
 	})
 	r.Header.Set("X-Agent-ID", workerID)
 	r.Header.Set("X-Task-ID", workerTaskID)
+
+	authenticateTaskActorForTest(r)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
